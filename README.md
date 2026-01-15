@@ -38,7 +38,7 @@ See `config/tlswrap98.ini` for an example.
 3. Add mbedTLS sources to your project (for example under `vendor/mbedtls`).
    - Required components: `library/ssl.c`, `library/ssl_tls.c`, `library/ctr_drbg.c`, `library/entropy.c`, `library/x509_crt.c`, `library/pk.c`, `library/pkparse.c`, `library/asn1parse.c`, `library/md.c`, `library/sha256.c`, `library/bignum.c`, `library/rsa.c`, `library/cipher.c`, `library/cipher_wrap.c`, `library/platform.c`, `library/timing.c`, `library/net_sockets.c`, plus any dependencies mbedTLS requires for TLS 1.2.
 4. Add include paths for `vendor/mbedtls/include`.
-5. Define `MBEDTLS_CONFIG_FILE="mbedtls_config.h"` and provide a config enabling TLS 1.2 client.
+5. Define `MBEDTLS_CONFIG_FILE="mbedtls_config.h"` and use the provided config at `vendor/mbedTLS/include/mbedtls_config.h` (TLS 1.2 client options are already enabled there).
 6. Link against `ws2_32.lib` and `shell32.lib`.
 
 ## Notes
