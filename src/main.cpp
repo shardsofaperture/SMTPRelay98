@@ -6,6 +6,11 @@
 #include <stdarg.h>
 #include <vector>
 
+#if defined(_MSC_VER)
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
+#endif
+
 #if defined(_MSC_VER) && (_MSC_VER <= 1200)
 static int vc6_snprintf(char* dst, size_t dstSize, const char* fmt, ...)
 {
