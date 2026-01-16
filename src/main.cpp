@@ -6,6 +6,20 @@
 #include <stdarg.h>
 #include <vector>
 
+#if defined(_MSC_VER) && (_MSC_VER <= 1200)
+static int vc6_snprintf(char* dst, size_t dstSize, const char* fmt, ...)
+{
+    if (!dst || dstSize == 0) return -1;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = _vsnprintf(dst, dstSize, fmt, ap);
+    va_end(ap);
+    dst[dstSize - 1] = '\0';
+    return n;
+}
+#define snprintf vc6_snprintf
+#endif
+
 #include "../vendor/mbedTLS/include/mbedtls/ssl.h"
 #include "../vendor/mbedTLS/include/mbedtls/ctr_drbg.h"
 #include "../vendor/mbedTLS/include/mbedtls/entropy.h"
@@ -718,7 +732,8 @@ static void stop_tunnels()
 
     g_shutdown = 1;
 
-    for (size_t i = 0; i < g_tunnels.size(); ++i)
+    size_t i;
+    for (i = 0; i < g_tunnels.size(); ++i)
     {
         TunnelState *state = g_tunnels[i];
         state->running = 0;
@@ -729,7 +744,7 @@ static void stop_tunnels()
         }
     }
 
-    for (size_t i = 0; i < g_tunnels.size(); ++i)
+    for (i = 0; i < g_tunnels.size(); ++i)
     {
         TunnelState *state = g_tunnels[i];
         if (state->thread)
