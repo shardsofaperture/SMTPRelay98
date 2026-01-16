@@ -17,7 +17,7 @@
 #endif
 
 #include <stddef.h>
-#include "../stdint.h"
+#include <stdint.h>
 
 #define MBEDTLS_XTEA_ENCRYPT     1
 #define MBEDTLS_XTEA_DECRYPT     0

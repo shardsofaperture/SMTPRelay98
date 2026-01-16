@@ -22,7 +22,7 @@
 #endif
 
 #include <stddef.h>
-#include "../stdint.h"
+#include <stdint.h>
 
 /* MBEDTLS_ERR_MD4_HW_ACCEL_FAILED is deprecated and should not be used. */
 /** MD4 hardware accelerator failed */

@@ -26,7 +26,7 @@
 #include MBEDTLS_CONFIG_FILE
 #endif
 
-#include "../stdint.h"
+#include <stdint.h>
 #include <stddef.h>
 
 /** Invalid input parameter(s). */

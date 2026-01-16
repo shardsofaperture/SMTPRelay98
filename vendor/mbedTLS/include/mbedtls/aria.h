@@ -24,7 +24,7 @@
 #endif
 
 #include <stddef.h>
-#include "../stdint.h"
+#include <stdint.h>
 
 #include "mbedtls/platform_util.h"
 
