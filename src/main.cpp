@@ -6,12 +6,12 @@
 #include <stdarg.h>
 #include <vector>
 
-#include "mbedtls/ssl.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/error.h"
-#include "mbedtls/x509_crt.h"
-#include "mbedtls/net_sockets.h"
+#include "../vendor/mbedTLS/include/mbedtls/ssl.h"
+#include "../vendor/mbedTLS/include/mbedtls/ctr_drbg.h"
+#include "../vendor/mbedTLS/include/mbedtls/entropy.h"
+#include "../vendor/mbedTLS/include/mbedtls/error.h"
+#include "../vendor/mbedTLS/include/mbedtls/x509_crt.h"
+#include "../vendor/mbedTLS/include/mbedtls/net_sockets.h"
 
 #define APP_CLASS_NAME "TLSWrap98Window"
 #define APP_TRAY_TOOLTIP "TLSWrap98"
