@@ -19,7 +19,7 @@
 #endif
 
 #include <stddef.h>
-#include <stdint.h>
+#include "../stdint.h"
 
 /* MBEDTLS_ERR_SHA512_HW_ACCEL_FAILED is deprecated and should not be used. */
 /** SHA-512 hardware accelerator failed */

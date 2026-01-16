@@ -21,7 +21,7 @@
 #endif
 
 #include <stddef.h>
-#include <stdint.h>
+#include "../stdint.h"
 
 /* MBEDTLS_ERR_MD5_HW_ACCEL_FAILED is deprecated and should not be used. */
 /** MD5 hardware accelerator failed */

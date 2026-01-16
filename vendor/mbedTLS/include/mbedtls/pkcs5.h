@@ -22,7 +22,7 @@
 #include "mbedtls/md.h"
 
 #include <stddef.h>
-#include <stdint.h>
+#include "../stdint.h"
 
 /** Bad input parameters to function. */
 #define MBEDTLS_ERR_PKCS5_BAD_INPUT_DATA                  -0x2f80

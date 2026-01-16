@@ -24,7 +24,7 @@
 #endif
 
 #include <stddef.h>
-#include <stdint.h>
+#include "../stdint.h"
 
 /* MBEDTLS_ERR_SHA1_HW_ACCEL_FAILED is deprecated and should not be used. */
 /** SHA-1 hardware accelerator failed */

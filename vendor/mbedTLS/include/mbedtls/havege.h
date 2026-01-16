@@ -17,7 +17,7 @@
 #endif
 
 #include <stddef.h>
-#include <stdint.h>
+#include "../stdint.h"
 
 #define MBEDTLS_HAVEGE_COLLECT_SIZE 1024
 
