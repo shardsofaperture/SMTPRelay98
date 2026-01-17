@@ -132,6 +132,28 @@ static void log_message(int level, const char *fmt, ...)
     LeaveCriticalSection(&g_logLock);
 }
 
+static void log_line(const char *tag, const char *fmt, ...)
+{
+    EnterCriticalSection(&g_logLock);
+    FILE *fp = fopen(APP_LOG_NAME, "a+");
+    if (fp)
+    {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(fp, "%04d-%02d-%02d %02d:%02d:%02d %s ",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, tag);
+
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(fp, fmt, args);
+        va_end(args);
+
+        fprintf(fp, "\r\n");
+        fclose(fp);
+    }
+    LeaveCriticalSection(&g_logLock);
+}
+
 static void get_app_path(char *buffer, size_t size)
 {
     char path[MAX_PATH];
@@ -400,23 +422,31 @@ static bool smtp_starttls(SOCKET sock, int timeoutMs, int logLevel)
     return true;
 }
 
-extern "C" int net_send_cb(void *ctx, const unsigned char *buf, size_t len)
+extern "C" int bio_send_dbg(void *ctx, const unsigned char *buf, size_t len)
 {
     SOCKET sock = *((SOCKET *)ctx);
     int ret = send(sock, (const char *)buf, (int)len, 0);
     if (ret == SOCKET_ERROR)
     {
+        int wsaErr = WSAGetLastError();
+        log_line("[TLS->R]", "TLS send failed: wsa=%d", wsaErr);
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
     return ret;
 }
 
-extern "C" int net_recv_cb(void *ctx, unsigned char *buf, size_t len)
+extern "C" int bio_recv_dbg(void *ctx, unsigned char *buf, size_t len)
 {
     SOCKET sock = *((SOCKET *)ctx);
     int ret = recv(sock, (char *)buf, (int)len, 0);
+    if (ret == 0)
+    {
+        log_line("[TLS<-R]", "remote closed (recv=0)");
+    }
     if (ret == SOCKET_ERROR)
     {
+        int wsaErr = WSAGetLastError();
+        log_line("[TLS<-R]", "TLS recv failed: wsa=%d", wsaErr);
         return MBEDTLS_ERR_NET_RECV_FAILED;
     }
     return ret;
@@ -477,7 +507,7 @@ static bool tls_handshake(SOCKET sock, TunnelConfig *cfg, mbedtls_ssl_context *s
         mbedtls_ssl_set_hostname(ssl, cfg->remoteHost);
     }
 
-    mbedtls_ssl_set_bio(ssl, &sock, net_send_cb, net_recv_cb, NULL);
+    mbedtls_ssl_set_bio(ssl, &sock, bio_send_dbg, bio_recv_dbg, NULL);
 
     while ((ret = mbedtls_ssl_handshake(ssl)) != 0)
     {
@@ -571,8 +601,15 @@ static DWORD WINAPI connection_thread(LPVOID param)
         if (FD_ISSET(clientSock, &readSet))
         {
             int r = recv(clientSock, buffer, sizeof(buffer), 0);
-            if (r <= 0)
+            if (r == 0)
             {
+                log_line("[L->APP]", "local client closed (recv=0)");
+                break;
+            }
+            if (r < 0)
+            {
+                int wsaErr = WSAGetLastError();
+                log_line("[L->APP]", "local recv failed: wsa=%d", wsaErr);
                 break;
             }
             int sent = 0;
@@ -585,7 +622,10 @@ static DWORD WINAPI connection_thread(LPVOID param)
                 }
                 if (w <= 0)
                 {
-                    log_message(cfg.logLevel, "%s: TLS write error %d", cfg.name, w);
+                    char errbuf[256];
+                    mbedtls_strerror(w, errbuf, sizeof(errbuf));
+                    log_line("[TLS->R]", "TLS write to remote failed: ret=%d (-0x%04x) %s",
+                             w, (unsigned int)(-w), errbuf);
                     goto cleanup;
                 }
                 sent += w;
@@ -600,8 +640,17 @@ static DWORD WINAPI connection_thread(LPVOID param)
             {
                 continue;
             }
+            if (r == 0)
+            {
+                log_line("[TLS<-R]", "TLS close_notify received");
+                break;
+            }
             if (r <= 0)
             {
+                char errbuf[256];
+                mbedtls_strerror(r, errbuf, sizeof(errbuf));
+                log_line("[TLS<-R]", "TLS read from remote failed: ret=%d (-0x%04x) %s",
+                         r, (unsigned int)(-r), errbuf);
                 break;
             }
             int sent = 0;
@@ -610,6 +659,8 @@ static DWORD WINAPI connection_thread(LPVOID param)
                 int w = send(clientSock, buffer + sent, r - sent, 0);
                 if (w <= 0)
                 {
+                    int wsaErr = WSAGetLastError();
+                    log_line("[APP->L]", "send to local client failed: wsa=%d", wsaErr);
                     goto cleanup;
                 }
                 sent += w;

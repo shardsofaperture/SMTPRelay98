@@ -13,8 +13,8 @@ extern "C" {
 
 /* pull these from main.cpp */
 extern "C" SOCKET connect_with_timeout(const char *host, int port, int timeoutMs);
-extern "C" int net_send_cb(void *ctx, const unsigned char *buf, size_t len);
-extern "C" int net_recv_cb(void *ctx, unsigned char *buf, size_t len);
+extern "C" int bio_send_dbg(void *ctx, const unsigned char *buf, size_t len);
+extern "C" int bio_recv_dbg(void *ctx, unsigned char *buf, size_t len);
 
 static void write_err(FILE *f, int ret)
 {
@@ -75,7 +75,7 @@ extern "C" void tls_smoketest(void)
     ret = mbedtls_ssl_set_hostname(&ssl, host); /* SNI */
     if(ret != 0) { fprintf(f, "set_hostname failed\r\n"); write_err(f, ret); goto done; }
 
-    mbedtls_ssl_set_bio(&ssl, &s, net_send_cb, net_recv_cb, NULL);
+    mbedtls_ssl_set_bio(&ssl, &s, bio_send_dbg, bio_recv_dbg, NULL);
 
     fprintf(f, "Handshake...\r\n");
     while((ret = mbedtls_ssl_handshake(&ssl)) != 0)
