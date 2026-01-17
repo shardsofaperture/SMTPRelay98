@@ -1,46 +1,81 @@
-# TLSWrap98
 
-TLSWrap98 is a Windows 98 SE system-tray TCP-to-TLS proxy inspired by WinSSLWrap/stunnel. It listens on local plaintext ports and forwards connections to modern TLS 1.2 servers using an embedded TLS library.
+
+# SMTPRelay98 / TLSWrap98
+
+SMTPRelay98 (also referred to as TLSWrap98) is a Windows 98–compatible local TLS
+relay that allows legacy, non-TLS-aware applications to communicate with modern
+TLS 1.2 servers.
+
+It runs as a lightweight system-tray application and exposes local plaintext
+TCP ports that are transparently bridged to remote TLS endpoints using an
+in-process mbedTLS stack.
+
+This project is designed to:
+- Run on Windows 98 / 98 SE
+- Compile with Visual C++ 6.0
+- Operate on Pentium III–class hardware
+- Avoid SChannel, OpenSSL, KernelEx, or system TLS dependencies
+
+---
+
+## How It Works
+
+Legacy applications connect to local plaintext ports (e.g. 2525, 2993).
+SMTPRelay98 establishes outbound TLS 1.2 connections to modern servers and
+forwards data bidirectionally.
+
+TLS is handled entirely inside the application.
+
+---
 
 ## Features
-- System tray app (Start/Stop, Open Config, View Log, Exit)
-- Multiple tunnels via INI file
-- DIRECT_TLS mode (immediate TLS)
-- STARTTLS_SMTP mode (SMTP STARTTLS upgrade)
-- TLS 1.2 client with optional SNI
-- Certificate verification disabled by default
-- Text log file
 
-## INI Schema
+- TLS 1.2 client support on Windows 98
+- Multiple tunnels via INI configuration
+- Direct TLS and SMTP STARTTLS modes
+- System tray control (start/stop, config, logs)
+- Fully in-process crypto (no external TLS libraries)
+- Built-in TLS smoketest mode
 
-**Global section** (optional):
-- `LogFile` (default `tlswrap98.log`)
-- `LogLevel` (0=errors, 1=info, 2=debug)
-- `ConnectTimeoutMs` (default 10000)
-- `IoTimeoutMs` (default 300000)
-- `StartTlsTimeoutMs` (default 10000)
+---
 
-**Tunnel section** (`[tunnel <name>]`):
-- `ListenAddr` (default `127.0.0.1`)
-- `ListenPort` (required)
-- `RemoteHost` (required)
-- `RemotePort` (required)
-- `Mode` (`DIRECT_TLS` or `STARTTLS_SMTP`)
-- `VerifyCert` (`0`/`1`, default `0`)
-- `SNI` (optional server name)
-- `LogLevel` (override global)
+## TLS Smoketest
 
-See `config/tlswrap98.ini` for an example.
+A built-in smoketest validates TCP, DNS, RNG, SNI, and TLS 1.2 independently of
+the tunnel system.
 
-## Build (Visual C++ 6.0)
-1. Create a new **Win32 GUI** project.
-2. Add `src/main.cpp` to the project.
-3. Add mbedTLS sources to your project (for example under `vendor/mbedTLS`).
-   - Required components (based on the default `src/mbedtls_config.h`): `library/ssl_tls.c`, `library/ssl_cli.c`, `library/ssl_ciphersuites.c`, `library/x509_crt.c`, `library/x509.c`, `library/asn1parse.c`, `library/asn1write.c`, `library/oid.c`, `library/pem.c`, `library/pk.c`, `library/pkparse.c`, `library/pk_wrap.c`, `library/cipher.c`, `library/cipher_wrap.c`, `library/md.c`, `library/md_wrap.c`, `library/sha256.c`, `library/aes.c`, `library/bignum.c`, `library/rsa.c`, `library/ecp.c`, `library/ecdh.c`, `library/ecdsa.c`, `library/ctr_drbg.c`, `library/entropy.c`, `library/entropy_poll.c`, `library/platform.c`, `library/platform_util.c`, `library/error.c`, `library/timing.c`.
-4. Add include paths for `vendor/mbedTLS/include` (required for building the mbedTLS sources).
-5. Define `MBEDTLS_CONFIG_FILE="mbedtls_config.h"` and use the provided config at `vendor/mbedTLS/include/mbedtls_config.h` (TLS 1.2 client options are already enabled there).
-6. Link against `ws2_32.lib` and `shell32.lib`.
+Run:
 
-## Notes
-- Certificate verification is disabled by default and should be enabled only if you supply CA certificates.
-- This project is a hobby-grade compatibility shim, not a hardened security product.
+
+smtprealy98.exe -tls-test
+
+
+This creates `tls_test.log` and performs a real TLS 1.2 handshake and HTTP
+request against a modern server.
+
+---
+
+## Configuration
+
+Runtime configuration is provided via `tlswrap98.ini`, which must reside next
+to the executable. Tunnel sections must be named `tunnel <name>` and define a
+local listen port and a remote TLS endpoint.
+
+---
+
+## License
+
+All original SMTPRelay98 / TLSWrap98 source code is licensed under the **MIT
+License**.
+
+This project statically links against **mbedTLS**, which is licensed under the
+**Apache License, Version 2.0**.
+
+Accordingly:
+- mbedTLS copyright and license notices are preserved
+- Apache 2.0 terms apply to the mbedTLS portions
+- MIT terms apply to all original project code
+
+See:
+- `LICENSE` (MIT)
+- `vendor/mbedTLS/LICENSE` (Apache 2.0)
