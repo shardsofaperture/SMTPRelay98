@@ -1,0 +1,14 @@
+MBEDTLS 2.16.4
+
+The mbedTLS source files included in this project are licensed under the
+Apache License, Version 2.0.
+
+See: license/apache-2.0.txt
+
+All other original source code and project files in this repository are
+licensed under the MIT License unless otherwise noted.
+
+See: license/MIT.txt
+
+
+

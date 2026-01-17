@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <vector>
+#include <string.h>
+
+
 
 #if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
@@ -12,6 +15,8 @@
 #endif
 
 #if defined(_MSC_VER) && (_MSC_VER <= 1200)
+
+
 static int vc6_snprintf(char* dst, size_t dstSize, const char* fmt, ...)
 {
     if (!dst || dstSize == 0) return -1;
@@ -264,7 +269,7 @@ static int socket_set_blocking(SOCKET s, bool blocking)
     return ioctlsocket(s, FIONBIO, &mode);
 }
 
-static SOCKET connect_with_timeout(const char *host, int port, int timeoutMs)
+extern "C" SOCKET connect_with_timeout(const char *host, int port, int timeoutMs)
 {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET)
@@ -395,7 +400,7 @@ static bool smtp_starttls(SOCKET sock, int timeoutMs, int logLevel)
     return true;
 }
 
-static int net_send_cb(void *ctx, const unsigned char *buf, size_t len)
+extern "C" int net_send_cb(void *ctx, const unsigned char *buf, size_t len)
 {
     SOCKET sock = *((SOCKET *)ctx);
     int ret = send(sock, (const char *)buf, (int)len, 0);
@@ -406,7 +411,7 @@ static int net_send_cb(void *ctx, const unsigned char *buf, size_t len)
     return ret;
 }
 
-static int net_recv_cb(void *ctx, unsigned char *buf, size_t len)
+extern "C" int net_recv_cb(void *ctx, unsigned char *buf, size_t len)
 {
     SOCKET sock = *((SOCKET *)ctx);
     int ret = recv(sock, (char *)buf, (int)len, 0);
@@ -861,19 +866,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+extern "C" void tls_smoketest(void);
+
+
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
-    g_hInstance = hInstance;
+g_hInstance = hInstance;
 
-    InitializeCriticalSection(&g_logLock);
-    load_default_config();
+InitializeCriticalSection(&g_logLock);
+load_default_config();
 
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-    {
-        MessageBoxA(NULL, "WSAStartup failed", "TLSWrap98", MB_OK | MB_ICONERROR);
-        return 1;
-    }
+WSADATA wsaData;
+if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+{
+    MessageBoxA(NULL, "WSAStartup failed", "TLSWrap98", MB_OK | MB_ICONERROR);
+    return 1;
+}
+
+if (lpCmdLine && strstr(lpCmdLine, "-tls-test"))
+{
+    tls_smoketest();
+    WSACleanup();
+    DeleteCriticalSection(&g_logLock);
+    return 0;
+}
+
 
     WNDCLASSA wc;
     memset(&wc, 0, sizeof(wc));
