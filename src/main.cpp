@@ -74,6 +74,7 @@ struct TunnelConfig
     char name[64];
     char listenAddr[64];
     int listenPort;
+    char announceName[256];
     char remoteHost[256];
     int remotePort;
     TunnelMode mode;
@@ -214,6 +215,8 @@ static void load_tunnel_config(const char *iniPath, const char *section, TunnelC
     GetPrivateProfileStringA(section, "ListenAddr", "127.0.0.1",
                              cfg->listenAddr, sizeof(cfg->listenAddr), iniPath);
     cfg->listenPort = GetPrivateProfileIntA(section, "ListenPort", 0, iniPath);
+    GetPrivateProfileStringA(section, "AnnounceName", "",
+                             cfg->announceName, sizeof(cfg->announceName), iniPath);
     GetPrivateProfileStringA(section, "RemoteHost", "",
                              cfg->remoteHost, sizeof(cfg->remoteHost), iniPath);
     cfg->remotePort = GetPrivateProfileIntA(section, "RemotePort", 0, iniPath);
@@ -372,6 +375,72 @@ static int recv_line(SOCKET sock, char *buffer, int size, int timeoutMs)
     }
     buffer[total] = '\0';
     return total;
+}
+
+static bool send_all_plain(SOCKET sock, const char *buffer, int length)
+{
+    int sent = 0;
+    while (sent < length)
+    {
+        int ret = send(sock, buffer + sent, length - sent, 0);
+        if (ret <= 0)
+        {
+            return false;
+        }
+        sent += ret;
+    }
+    return true;
+}
+
+static bool smtp_discard_banner(SOCKET sock, int timeoutMs)
+{
+    char line[512];
+    for (;;)
+    {
+        int len = recv_line(sock, line, sizeof(line), timeoutMs);
+        if (len <= 0)
+        {
+            return false;
+        }
+        if (len >= 4 && line[3] == '-')
+        {
+            continue;
+        }
+        break;
+    }
+    return true;
+}
+
+static bool smtp_forward_response(SOCKET remoteSock, SOCKET clientSock, int timeoutMs, bool *gotOk)
+{
+    char line[512];
+    bool ok = false;
+    for (;;)
+    {
+        int len = recv_line(remoteSock, line, sizeof(line), timeoutMs);
+        if (len <= 0)
+        {
+            return false;
+        }
+        if (!send_all_plain(clientSock, line, len))
+        {
+            return false;
+        }
+        if (len >= 4 && line[3] == '-')
+        {
+            continue;
+        }
+        if (strncmp(line, "250", 3) == 0)
+        {
+            ok = true;
+        }
+        break;
+    }
+    if (gotOk)
+    {
+        *gotOk = ok;
+    }
+    return true;
 }
 
 static bool smtp_starttls(SOCKET sock, int timeoutMs, int logLevel)
@@ -534,6 +603,93 @@ static void tls_cleanup(mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
     mbedtls_x509_crt_free(cacert);
 }
 
+static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelConfig *cfg,
+                               mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
+                               mbedtls_ctr_drbg_context *ctr_drbg, mbedtls_entropy_context *entropy,
+                               mbedtls_x509_crt *cacert)
+{
+    char line[512];
+    int len = recv_line(clientSock, line, sizeof(line), g_config.ioTimeoutMs);
+    if (len <= 0)
+    {
+        log_line("[SMTP]", "local client closed before command");
+        return false;
+    }
+
+    SOCKET remoteSock = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
+                                             g_config.connectTimeoutMs);
+    if (remoteSock == INVALID_SOCKET)
+    {
+        log_message(cfg->logLevel, "%s: connect failed", cfg->name);
+        return false;
+    }
+
+    if (!smtp_discard_banner(remoteSock, g_config.startTlsTimeoutMs))
+    {
+        log_message(cfg->logLevel, "[SMTP] failed to read remote banner");
+        closesocket(remoteSock);
+        return false;
+    }
+    log_message(cfg->logLevel, "[SMTP] connected upstream, discarded remote 220 banner");
+
+    bool upgraded = false;
+    bool haveLine = true;
+    while (!upgraded)
+    {
+        if (!haveLine)
+        {
+            len = recv_line(clientSock, line, sizeof(line), g_config.ioTimeoutMs);
+            if (len <= 0)
+            {
+                closesocket(remoteSock);
+                return false;
+            }
+        }
+        haveLine = false;
+
+        bool isEhlo = (_strnicmp(line, "EHLO", 4) == 0) || (_strnicmp(line, "HELO", 4) == 0);
+        if (!send_all_plain(remoteSock, line, len))
+        {
+            closesocket(remoteSock);
+            return false;
+        }
+
+        bool gotOk = false;
+        if (!smtp_forward_response(remoteSock, clientSock, g_config.startTlsTimeoutMs, &gotOk))
+        {
+            closesocket(remoteSock);
+            return false;
+        }
+
+        if (isEhlo && gotOk)
+        {
+            log_message(cfg->logLevel, "[SMTP] relayed EHLO, now upgrading upstream via STARTTLS");
+            if (!send_all_plain(remoteSock, "STARTTLS\r\n", 10))
+            {
+                closesocket(remoteSock);
+                return false;
+            }
+            len = recv_line(remoteSock, line, sizeof(line), g_config.startTlsTimeoutMs);
+            if (len <= 0 || strncmp(line, "220", 3) != 0)
+            {
+                log_message(cfg->logLevel, "[SMTP] STARTTLS rejected: %s", line);
+                closesocket(remoteSock);
+                return false;
+            }
+            if (!tls_handshake(remoteSock, cfg, ssl, conf, ctr_drbg, entropy, cacert))
+            {
+                closesocket(remoteSock);
+                return false;
+            }
+            log_message(cfg->logLevel, "[SMTP] upstream TLS handshake OK");
+            upgraded = true;
+        }
+    }
+
+    *remoteSockOut = remoteSock;
+    return true;
+}
+
 static DWORD WINAPI connection_thread(LPVOID param)
 {
     ConnectionContext *ctx = (ConnectionContext *)param;
@@ -544,13 +700,127 @@ static DWORD WINAPI connection_thread(LPVOID param)
 
     if (cfg.mode == MODE_STARTTLS_SMTP)
     {
-        if (!smtp_starttls(remoteSock, g_config.startTlsTimeoutMs, cfg.logLevel))
+        mbedtls_ssl_context ssl;
+        mbedtls_ssl_config conf;
+        mbedtls_ctr_drbg_context ctr_drbg;
+        mbedtls_entropy_context entropy;
+        mbedtls_x509_crt cacert;
+
+        if (!smtp_lazy_starttls(clientSock, &remoteSock, &cfg, &ssl, &conf,
+                                &ctr_drbg, &entropy, &cacert))
         {
             closesocket(clientSock);
-            closesocket(remoteSock);
             return 0;
         }
+
         log_message(cfg.logLevel, "%s: STARTTLS completed", cfg.name);
+
+        DWORD lastActivity = GetTickCount();
+        char buffer[4096];
+
+        while (!g_shutdown)
+        {
+            DWORD now = GetTickCount();
+            if ((int)(now - lastActivity) > g_config.ioTimeoutMs)
+            {
+                log_message(cfg.logLevel, "%s: idle timeout", cfg.name);
+                break;
+            }
+
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(clientSock, &readSet);
+            FD_SET(remoteSock, &readSet);
+            timeval tv;
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+
+            int ret = select(0, &readSet, NULL, NULL, &tv);
+            if (ret == SOCKET_ERROR)
+            {
+                break;
+            }
+            if (ret == 0)
+            {
+                continue;
+            }
+
+            if (FD_ISSET(clientSock, &readSet))
+            {
+                int r = recv(clientSock, buffer, sizeof(buffer), 0);
+                if (r == 0)
+                {
+                    log_line("[L->APP]", "local client closed (recv=0)");
+                    break;
+                }
+                if (r < 0)
+                {
+                    int wsaErr = WSAGetLastError();
+                    log_line("[L->APP]", "local recv failed: wsa=%d", wsaErr);
+                    break;
+                }
+                int sent = 0;
+                while (sent < r)
+                {
+                    int w = mbedtls_ssl_write(&ssl, (const unsigned char *)buffer + sent, r - sent);
+                    if (w == MBEDTLS_ERR_SSL_WANT_READ || w == MBEDTLS_ERR_SSL_WANT_WRITE)
+                    {
+                        continue;
+                    }
+                    if (w <= 0)
+                    {
+                        char errbuf[256];
+                        mbedtls_strerror(w, errbuf, sizeof(errbuf));
+                        log_line("[TLS->R]", "TLS write to remote failed: ret=%d (-0x%04x) %s",
+                                 w, (unsigned int)(-w), errbuf);
+                        goto smtp_cleanup;
+                    }
+                    sent += w;
+                }
+                lastActivity = GetTickCount();
+            }
+
+            if (FD_ISSET(remoteSock, &readSet))
+            {
+                int r = mbedtls_ssl_read(&ssl, (unsigned char *)buffer, sizeof(buffer));
+                if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE)
+                {
+                    continue;
+                }
+                if (r == 0)
+                {
+                    log_line("[TLS<-R]", "TLS close_notify received");
+                    break;
+                }
+                if (r <= 0)
+                {
+                    char errbuf[256];
+                    mbedtls_strerror(r, errbuf, sizeof(errbuf));
+                    log_line("[TLS<-R]", "TLS read from remote failed: ret=%d (-0x%04x) %s",
+                             r, (unsigned int)(-r), errbuf);
+                    break;
+                }
+                int sent = 0;
+                while (sent < r)
+                {
+                    int w = send(clientSock, buffer + sent, r - sent, 0);
+                    if (w <= 0)
+                    {
+                        int wsaErr = WSAGetLastError();
+                        log_line("[APP->L]", "send to local client failed: wsa=%d", wsaErr);
+                        goto smtp_cleanup;
+                    }
+                    sent += w;
+                }
+                lastActivity = GetTickCount();
+            }
+        }
+
+smtp_cleanup:
+        tls_cleanup(&ssl, &conf, &ctr_drbg, &entropy, &cacert);
+        closesocket(clientSock);
+        closesocket(remoteSock);
+        return 0;
     }
 
     mbedtls_ssl_context ssl;
@@ -724,14 +994,32 @@ static DWORD WINAPI listener_thread(LPVOID param)
             continue;
         }
 
-        SOCKET remoteSock = connect_with_timeout(state->cfg.remoteHost,
-                                                 state->cfg.remotePort,
-                                                 g_config.connectTimeoutMs);
-        if (remoteSock == INVALID_SOCKET)
+        SOCKET remoteSock = INVALID_SOCKET;
+        if (state->cfg.mode == MODE_STARTTLS_SMTP)
         {
-            log_message(state->cfg.logLevel, "%s: connect failed", state->cfg.name);
-            closesocket(clientSock);
-            continue;
+            const char *announce = state->cfg.announceName[0] != '\0'
+                                       ? state->cfg.announceName
+                                       : "localhost";
+            char banner[320];
+            snprintf(banner, sizeof(banner), "220 %s ESMTP TLSWrap98\r\n", announce);
+            if (!send_all_plain(clientSock, banner, (int)strlen(banner)))
+            {
+                closesocket(clientSock);
+                continue;
+            }
+            log_message(state->cfg.logLevel, "[SMTP] sent local 220 banner");
+        }
+        else
+        {
+            remoteSock = connect_with_timeout(state->cfg.remoteHost,
+                                              state->cfg.remotePort,
+                                              g_config.connectTimeoutMs);
+            if (remoteSock == INVALID_SOCKET)
+            {
+                log_message(state->cfg.logLevel, "%s: connect failed", state->cfg.name);
+                closesocket(clientSock);
+                continue;
+            }
         }
 
         ConnectionContext *ctx = new ConnectionContext();
