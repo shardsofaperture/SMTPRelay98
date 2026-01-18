@@ -591,6 +591,8 @@ static bool read_smtp_reply(SOCKET sock, char *out_buf, int out_cap, int *code,
     }
 }
 
+static int tls_ssl_recv_line(mbedtls_ssl_context *ssl, char *buffer, int size, int timeoutMs);
+
 static bool read_smtp_reply_tls(mbedtls_ssl_context *ssl, char *out_buf, int out_cap, int *code,
                                 bool *is_multiline_complete, int timeoutMs, int logLevel)
 {
@@ -604,7 +606,7 @@ static bool read_smtp_reply_tls(mbedtls_ssl_context *ssl, char *out_buf, int out
     for (;;)
     {
         char line[512];
-        int len = tls_recv_line(ssl, line, sizeof(line), timeoutMs);
+        int len = tls_ssl_recv_line(ssl, line, sizeof(line), timeoutMs);
         if (len <= 0)
         {
             return false;
@@ -810,7 +812,7 @@ static void log_lines_from_buffer(int level, const char *prefix, const char *dat
     }
 }
 
-static int tls_recv_line(mbedtls_ssl_context *ssl, char *buffer, int size, int timeoutMs)
+static int tls_ssl_recv_line(mbedtls_ssl_context *ssl, char *buffer, int size, int timeoutMs)
 {
     int total = 0;
     DWORD start = GetTickCount();
@@ -1080,6 +1082,164 @@ static bool tls_send_all(mbedtls_ssl_context *ssl, const char *buffer, int lengt
     return true;
 }
 
+static bool smtp_auth_plain_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg, int *authCode)
+{
+    if (authCode)
+    {
+        *authCode = 0;
+    }
+
+    unsigned char plainBuf[512];
+    int plainLen = 0;
+    plainBuf[plainLen++] = '\0';
+    strncpy((char *)plainBuf + plainLen, cfg->upstreamUser,
+            sizeof(plainBuf) - plainLen - 1);
+    plainLen += (int)strlen(cfg->upstreamUser);
+    plainBuf[plainLen++] = '\0';
+    strncpy((char *)plainBuf + plainLen, cfg->upstreamPass,
+            sizeof(plainBuf) - plainLen - 1);
+    plainLen += (int)strlen(cfg->upstreamPass);
+    plainBuf[plainLen] = '\0';
+
+    char encoded[1024];
+    if (base64_encode(plainBuf, plainLen, encoded, sizeof(encoded)) <= 0)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH PLAIN base64 encode failed");
+        return false;
+    }
+
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd), "AUTH PLAIN %s\r\n", encoded);
+    log_message(cfg->logLevel, "[SMTP] AUTH PLAIN sent");
+    if (!tls_send_all(ssl, cmd, (int)strlen(cmd), cfg->logLevel))
+    {
+        return false;
+    }
+
+    char reply[1024];
+    int code = 0;
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.ioTimeoutMs, cfg->logLevel))
+    {
+        return false;
+    }
+    if (authCode)
+    {
+        *authCode = code;
+    }
+    if (code == 235)
+    {
+        return true;
+    }
+    if (code == 530)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH rejected with 530");
+    }
+    else
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH rejected (code=%d)", code);
+    }
+    return false;
+}
+
+static bool smtp_auth_login_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg, int *authCode)
+{
+    if (authCode)
+    {
+        *authCode = 0;
+    }
+
+    const char *cmd = "AUTH LOGIN\r\n";
+    log_message(cfg->logLevel, "[SMTP] AUTH LOGIN sent");
+    if (!tls_send_all(ssl, cmd, (int)strlen(cmd), cfg->logLevel))
+    {
+        return false;
+    }
+
+    char reply[1024];
+    int code = 0;
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.ioTimeoutMs, cfg->logLevel))
+    {
+        return false;
+    }
+    if (code != 334)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN not accepted (code=%d)", code);
+        if (authCode)
+        {
+            *authCode = code;
+        }
+        return false;
+    }
+
+    char encodedUser[256];
+    if (base64_encode((const unsigned char *)cfg->upstreamUser,
+                      (int)strlen(cfg->upstreamUser),
+                      encodedUser, sizeof(encodedUser)) <= 0)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN user encode failed");
+        return false;
+    }
+    char userCmd[300];
+    snprintf(userCmd, sizeof(userCmd), "%s\r\n", encodedUser);
+    if (!tls_send_all(ssl, userCmd, (int)strlen(userCmd), cfg->logLevel))
+    {
+        return false;
+    }
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.ioTimeoutMs, cfg->logLevel))
+    {
+        return false;
+    }
+    if (code != 334)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN user rejected (code=%d)", code);
+        if (authCode)
+        {
+            *authCode = code;
+        }
+        return false;
+    }
+
+    char encodedPass[256];
+    if (base64_encode((const unsigned char *)cfg->upstreamPass,
+                      (int)strlen(cfg->upstreamPass),
+                      encodedPass, sizeof(encodedPass)) <= 0)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN pass encode failed");
+        return false;
+    }
+    char passCmd[300];
+    snprintf(passCmd, sizeof(passCmd), "%s\r\n", encodedPass);
+    if (!tls_send_all(ssl, passCmd, (int)strlen(passCmd), cfg->logLevel))
+    {
+        return false;
+    }
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.ioTimeoutMs, cfg->logLevel))
+    {
+        return false;
+    }
+    if (authCode)
+    {
+        *authCode = code;
+    }
+    if (code == 235)
+    {
+        return true;
+    }
+    if (code == 530)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN rejected with 530");
+    }
+    else
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN rejected (code=%d)", code);
+    }
+    return false;
+}
+
 static bool smtp_authenticate_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
                                   const char *ehloReply, int *authCode)
 {
@@ -1128,157 +1288,12 @@ static bool smtp_authenticate_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
 
     if (mode == AUTH_MODE_PLAIN)
     {
-        unsigned char plainBuf[512];
-        int plainLen = 0;
-        plainBuf[plainLen++] = '\0';
-        strncpy((char *)plainBuf + plainLen, cfg->upstreamUser,
-                sizeof(plainBuf) - plainLen - 1);
-        plainLen += (int)strlen(cfg->upstreamUser);
-        plainBuf[plainLen++] = '\0';
-        strncpy((char *)plainBuf + plainLen, cfg->upstreamPass,
-                sizeof(plainBuf) - plainLen - 1);
-        plainLen += (int)strlen(cfg->upstreamPass);
-        plainBuf[plainLen] = '\0';
-
-        char encoded[1024];
-        if (base64_encode(plainBuf, plainLen, encoded, sizeof(encoded)) <= 0)
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH PLAIN base64 encode failed");
-            return false;
-        }
-
-        char cmd[1200];
-        snprintf(cmd, sizeof(cmd), "AUTH PLAIN %s\r\n", encoded);
-        log_message(cfg->logLevel, "[SMTP] AUTH PLAIN sent");
-        if (!tls_send_all(ssl, cmd, (int)strlen(cmd), cfg->logLevel))
-        {
-            return false;
-        }
-
-        char reply[1024];
-        int code = 0;
-        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
-                                 g_config.ioTimeoutMs, cfg->logLevel))
-        {
-            return false;
-        }
-        if (code == 235)
-        {
-            if (authCode)
-            {
-                *authCode = code;
-            }
-            return true;
-        }
-        if (code == 530)
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH rejected with 530");
-        }
-        else
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH rejected (code=%d)", code);
-        }
-        if (authCode)
-        {
-            *authCode = code;
-        }
-        return false;
+        return smtp_auth_plain_tls(ssl, cfg, authCode);
     }
 
     if (mode == AUTH_MODE_LOGIN)
     {
-        const char *cmd = "AUTH LOGIN\r\n";
-        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN sent");
-        if (!tls_send_all(ssl, cmd, (int)strlen(cmd), cfg->logLevel))
-        {
-            return false;
-        }
-        char reply[1024];
-        int code = 0;
-        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
-                                 g_config.ioTimeoutMs, cfg->logLevel))
-        {
-            return false;
-        }
-        if (code != 334)
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN not accepted (code=%d)", code);
-            if (authCode)
-            {
-                *authCode = code;
-            }
-            return false;
-        }
-
-        char encodedUser[256];
-        if (base64_encode((const unsigned char *)cfg->upstreamUser,
-                          (int)strlen(cfg->upstreamUser),
-                          encodedUser, sizeof(encodedUser)) <= 0)
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN user encode failed");
-            return false;
-        }
-        char userCmd[300];
-        snprintf(userCmd, sizeof(userCmd), "%s\r\n", encodedUser);
-        if (!tls_send_all(ssl, userCmd, (int)strlen(userCmd), cfg->logLevel))
-        {
-            return false;
-        }
-        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
-                                 g_config.ioTimeoutMs, cfg->logLevel))
-        {
-            return false;
-        }
-        if (code != 334)
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN user rejected (code=%d)", code);
-            if (authCode)
-            {
-                *authCode = code;
-            }
-            return false;
-        }
-
-        char encodedPass[256];
-        if (base64_encode((const unsigned char *)cfg->upstreamPass,
-                          (int)strlen(cfg->upstreamPass),
-                          encodedPass, sizeof(encodedPass)) <= 0)
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN pass encode failed");
-            return false;
-        }
-        char passCmd[300];
-        snprintf(passCmd, sizeof(passCmd), "%s\r\n", encodedPass);
-        if (!tls_send_all(ssl, passCmd, (int)strlen(passCmd), cfg->logLevel))
-        {
-            return false;
-        }
-        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
-                                 g_config.ioTimeoutMs, cfg->logLevel))
-        {
-            return false;
-        }
-        if (code == 235)
-        {
-            if (authCode)
-            {
-                *authCode = code;
-            }
-            return true;
-        }
-        if (code == 530)
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN rejected with 530");
-        }
-        else
-        {
-            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN rejected (code=%d)", code);
-        }
-        if (authCode)
-        {
-            *authCode = code;
-        }
-        return false;
+        return smtp_auth_login_tls(ssl, cfg, authCode);
     }
 
     return false;
@@ -1319,6 +1334,7 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
         return false;
     }
     log_smtp_line(LOG_DEBUG, "C:", line);
+    log_client_command_state(cfg->logLevel, line);
 
     SOCKET rs = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
                                      g_config.connectTimeoutMs);
@@ -1356,6 +1372,7 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
                 return false;
             }
             log_smtp_line(LOG_DEBUG, "C:", line);
+            log_client_command_state(cfg->logLevel, line);
         }
         haveLine = false;
 
@@ -1454,7 +1471,7 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
         }
         log_state_transition(cfg->logLevel, "EHLO2");
 
-        if (cfg->remotePort == 587)
+        if (cfg->upstreamUser[0] != '\0' && cfg->upstreamPass[0] != '\0')
         {
             int authCode = 0;
             if (!smtp_authenticate_tls(ssl, cfg, reply, &authCode))
@@ -1466,6 +1483,10 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
                 return false;
             }
             log_state_transition(cfg->logLevel, "AUTH_OK");
+        }
+        else
+        {
+            log_message(cfg->logLevel, "[SMTP] no upstream credentials configured");
         }
     }
 
