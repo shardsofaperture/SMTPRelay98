@@ -61,7 +61,8 @@ They were an earlier, more fragile workaround and are now obsolete.
 ## Non-Goals / Intentional Limitations
 
 - No local TLS / STARTTLS support (by design)
-- No POP3 or IMAP proxying
+- Supports generic DIRECT_TLS tunneling for protocols that use implicit TLS (e.g., IMAPS 993, POP3S 995).
+- SMTP submission additionally supports STARTTLS + AUTH via a dedicated mode (still flushing out this feature)
 - No mail storage, spooling, or queueing
 - No Kerberos, OAuth, or modern auth schemes
 - No strong credential protection beyond basic obfuscation
@@ -113,6 +114,18 @@ VerifyCert=1
 upstream_user=your@email.com
 upstream_pass=yourpassword
 auth_mode=auto
+
+[tunnel imaps]
+ListenAddr=127.0.0.1
+ListenPort=143
+RemoteHost=imap.example.com
+RemotePort=993
+Mode=DIRECT_TLS
+SNI=imap.example.com
+VerifyCert=1
+
+
+
 ```
 
 ### Authentication Modes
