@@ -753,6 +753,34 @@ static void parse_auth_caps(const char *reply, bool *hasPlain, bool *hasLogin)
     }
 }
 
+static bool parse_starttls_cap(const char *reply)
+{
+    if (!reply)
+    {
+        return false;
+    }
+    const char *ptr = reply;
+    while (*ptr)
+    {
+        const char *lineEnd = strstr(ptr, "\n");
+        int lineLen = lineEnd ? (int)(lineEnd - ptr) + 1 : (int)strlen(ptr);
+        char line[512];
+        int copyLen = lineLen < (int)sizeof(line) - 1 ? lineLen : (int)sizeof(line) - 1;
+        memcpy(line, ptr, copyLen);
+        line[copyLen] = '\0';
+        if (find_case_insensitive(line, "STARTTLS"))
+        {
+            return true;
+        }
+        if (!lineEnd)
+        {
+            break;
+        }
+        ptr = lineEnd + 1;
+    }
+    return false;
+}
+
 static void log_client_command_state(int level, const char *line)
 {
     if (!line)
@@ -863,6 +891,15 @@ static bool send_all_plain(SOCKET sock, const char *buffer, int length)
         sent += ret;
     }
     return true;
+}
+
+static bool send_client_response(SOCKET clientSock, const char *response)
+{
+    if (!response)
+    {
+        return false;
+    }
+    return send_all_plain(clientSock, response, (int)strlen(response));
 }
 
 static bool smtp_discard_banner(SOCKET sock, int timeoutMs, int logLevel, SmtpRecvBuffer *state)
@@ -1299,210 +1336,196 @@ static bool smtp_authenticate_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
     return false;
 }
 
-static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelConfig *cfg,
-                               mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
-                               mbedtls_ctr_drbg_context *ctr_drbg, mbedtls_entropy_context *entropy,
-                               mbedtls_x509_crt *cacert)
+static bool smtp_connect_upstream(TunnelConfig *cfg, SOCKET *remoteSockOut,
+                                  mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
+                                  mbedtls_ctr_drbg_context *ctr_drbg,
+                                  mbedtls_entropy_context *entropy, mbedtls_x509_crt *cacert,
+                                  char *ehloReply, int ehloReplyCap)
 {
-    /*
-    Expected transcript (local client is plaintext, upstream is TLS after STARTTLS):
-      S: 220 relay.example ESMTP TLSWrap98
-      C: EHLO local
-      S: 250-relay.example Hello
-      S: 250-STARTTLS
-      S: 250 AUTH PLAIN LOGIN
-      C: STARTTLS
-      S: 220 Ready to start TLS
-      (TLS handshake with upstream)
-      S: 250-relay.example Hello (post-TLS)
-      S: 250 AUTH PLAIN LOGIN
-      (AUTH PLAIN/LOGIN upstream)
-      C: MAIL FROM:<user@example>
-      S: 250 OK
-    */
-    char line[512];
-    SmtpRecvBuffer clientState;
-    SmtpRecvBuffer remoteState;
-    memset(&clientState, 0, sizeof(clientState));
-    memset(&remoteState, 0, sizeof(remoteState));
-
-    int len = smtp_read_line_buffered(clientSock, line, sizeof(line),
-                                      g_config.ioTimeoutMs, &clientState);
-    if (len <= 0)
+    if (!cfg || !remoteSockOut)
     {
-        log_line("[SMTP]", "local client closed before command");
         return false;
     }
-    log_smtp_line(LOG_DEBUG, "C:", line);
-    log_client_command_state(cfg->logLevel, line);
 
-    SOCKET rs = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
-                                     g_config.connectTimeoutMs);
-    if (rs == INVALID_SOCKET)
+    *remoteSockOut = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
+                                          g_config.connectTimeoutMs);
+    if (*remoteSockOut == INVALID_SOCKET)
     {
         log_message(cfg->logLevel, "%s: connect failed", cfg->name);
         return false;
     }
-    *remoteSockOut = rs;
 
     log_state_transition(cfg->logLevel, "CONNECT");
 
-    if (!smtp_discard_banner(*remoteSockOut, g_config.startTlsTimeoutMs,
-                             LOG_DEBUG, &remoteState))
+    SmtpRecvBuffer remoteState;
+    memset(&remoteState, 0, sizeof(remoteState));
+    char reply[2048];
+    int code = 0;
+    if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
+                         &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
     {
-        log_message(cfg->logLevel, "[SMTP] failed to read remote banner");
+        log_message(cfg->logLevel, "[SMTP] failed to read upstream banner");
         closesocket(*remoteSockOut);
         *remoteSockOut = INVALID_SOCKET;
         return false;
     }
-    log_message(cfg->logLevel, "[SMTP] connected upstream, discarded remote 220 banner");
 
-    bool upgraded = false;
-    bool haveLine = true;
-    while (!upgraded)
+    const char *ehlo = "EHLO localhost\r\n";
+    if (!send_all_plain(*remoteSockOut, ehlo, (int)strlen(ehlo)))
     {
-        if (!haveLine)
-        {
-            len = smtp_read_line_buffered(clientSock, line, sizeof(line),
-                                          g_config.ioTimeoutMs, &clientState);
-            if (len <= 0)
-            {
-                closesocket(*remoteSockOut);
-                *remoteSockOut = INVALID_SOCKET;
-                return false;
-            }
-            log_smtp_line(LOG_DEBUG, "C:", line);
-            log_client_command_state(cfg->logLevel, line);
-        }
-        haveLine = false;
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
+    log_state_transition(cfg->logLevel, "EHLO");
+    if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
+                         &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
+    {
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
+    if (code != 250)
+    {
+        log_message(cfg->logLevel, "[SMTP] upstream EHLO rejected (code=%d)", code);
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
+    if (!parse_starttls_cap(reply))
+    {
+        log_message(cfg->logLevel, "[SMTP] upstream did not advertise STARTTLS");
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
 
-        bool isEhlo = (_strnicmp(line, "EHLO", 4) == 0) || (_strnicmp(line, "HELO", 4) == 0);
-        if (!send_all_plain(*remoteSockOut, line, len))
+    const char *starttls = "STARTTLS\r\n";
+    if (!send_all_plain(*remoteSockOut, starttls, (int)strlen(starttls)))
+    {
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
+    log_state_transition(cfg->logLevel, "STARTTLS");
+    if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
+                         &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
+    {
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
+    if (code != 220)
+    {
+        log_message(cfg->logLevel, "[SMTP] STARTTLS rejected (code=%d)", code);
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
+
+    if (!tls_handshake(remoteSockOut, cfg, ssl, conf, ctr_drbg, entropy, cacert))
+    {
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
+        return false;
+    }
+    log_state_transition(cfg->logLevel, "TLS_OK");
+
+    if (!tls_send_all(ssl, ehlo, (int)strlen(ehlo), cfg->logLevel))
+    {
+        log_message(cfg->logLevel, "[SMTP] post-TLS EHLO write failed");
+        return false;
+    }
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.startTlsTimeoutMs, LOG_DEBUG))
+    {
+        log_message(cfg->logLevel, "[SMTP] post-TLS EHLO read failed");
+        return false;
+    }
+    if (code != 250)
+    {
+        log_message(cfg->logLevel, "[SMTP] post-TLS EHLO rejected (code=%d)", code);
+        return false;
+    }
+    log_state_transition(cfg->logLevel, "EHLO2");
+    if (ehloReply && ehloReplyCap > 0)
+    {
+        strncpy(ehloReply, reply, ehloReplyCap - 1);
+        ehloReply[ehloReplyCap - 1] = '\0';
+    }
+
+    int authCode = 0;
+    if (!smtp_authenticate_tls(ssl, cfg, reply, &authCode))
+    {
+        log_message(cfg->logLevel, "[SMTP] upstream authentication failed");
+        return false;
+    }
+    log_state_transition(cfg->logLevel, "AUTH_OK");
+
+    return true;
+}
+
+static bool smtp_handle_data(SOCKET clientSock, mbedtls_ssl_context *ssl, TunnelConfig *cfg,
+                             SmtpRecvBuffer *clientState)
+{
+    char reply[2048];
+    int code = 0;
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.ioTimeoutMs, LOG_DEBUG))
+    {
+        return false;
+    }
+    if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+    {
+        return false;
+    }
+    if (code != 354)
+    {
+        return true;
+    }
+
+    for (;;)
+    {
+        char line[1024];
+        int len = smtp_read_line_buffered(clientSock, line, sizeof(line),
+                                          g_config.ioTimeoutMs, clientState);
+        if (len <= 0)
         {
-            closesocket(*remoteSockOut);
-            *remoteSockOut = INVALID_SOCKET;
             return false;
         }
-
-        bool gotOk = false;
-        if (isEhlo)
+        log_smtp_line(LOG_DEBUG, "C:", line);
+        if (line[0] == '.' && (line[1] == '\r' || line[1] == '\n' || line[1] == '\0'))
         {
-            log_state_transition(cfg->logLevel, "EHLO");
+            log_state_transition(cfg->logLevel, "DOT");
+            if (!tls_send_all(ssl, line, len, cfg->logLevel))
+            {
+                return false;
+            }
+            break;
         }
 
-        if (!smtp_forward_response(*remoteSockOut, clientSock, g_config.startTlsTimeoutMs,
-                                   &gotOk, LOG_DEBUG, &remoteState))
+        if (line[0] == '.')
         {
-            closesocket(*remoteSockOut);
-            *remoteSockOut = INVALID_SOCKET;
+            if (!tls_send_all(ssl, ".", 1, cfg->logLevel))
+            {
+                return false;
+            }
+        }
+        if (!tls_send_all(ssl, line, len, cfg->logLevel))
+        {
             return false;
-        }
-
-        if (isEhlo && gotOk)
-        {
-            log_message(cfg->logLevel, "[SMTP] relayed client EHLO/HELO");
-            if (!send_all_plain(*remoteSockOut, "STARTTLS\r\n", 10))
-            {
-                closesocket(*remoteSockOut);
-                *remoteSockOut = INVALID_SOCKET;
-                return false;
-            }
-            log_state_transition(cfg->logLevel, "STARTTLS");
-            char reply[1024];
-            int code = 0;
-            if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
-                                 &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
-            {
-                log_message(cfg->logLevel, "[SMTP] STARTTLS no response");
-                closesocket(*remoteSockOut);
-                *remoteSockOut = INVALID_SOCKET;
-                return false;
-            }
-            if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
-            {
-                closesocket(*remoteSockOut);
-                *remoteSockOut = INVALID_SOCKET;
-                return false;
-            }
-            if (code != 220)
-            {
-                log_message(cfg->logLevel, "[SMTP] STARTTLS rejected (code=%d)", code);
-                closesocket(*remoteSockOut);
-                *remoteSockOut = INVALID_SOCKET;
-                return false;
-            }
-            log_message(cfg->logLevel, "[SMTP] upstream STARTTLS accepted");
-            if (!tls_handshake(remoteSockOut, cfg, ssl, conf, ctr_drbg, entropy, cacert))
-            {
-                closesocket(*remoteSockOut);
-                *remoteSockOut = INVALID_SOCKET;
-                return false;
-            }
-            log_state_transition(cfg->logLevel, "TLS_OK");
-            upgraded = true;
         }
     }
 
-    if (upgraded)
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.ioTimeoutMs, LOG_DEBUG))
     {
-        const char *postEhlo = "EHLO localhost\r\n";
-        if (!tls_send_all(ssl, postEhlo, (int)strlen(postEhlo), cfg->logLevel))
-        {
-            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO write failed");
-            return false;
-        }
-
-        char reply[2048];
-        int code = 0;
-        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
-                                 g_config.startTlsTimeoutMs, LOG_DEBUG))
-        {
-            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO read failed");
-            return false;
-        }
-        if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
-        {
-            return false;
-        }
-        if (code != 250)
-        {
-            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO rejected (code=%d)", code);
-            return false;
-        }
-        log_state_transition(cfg->logLevel, "EHLO2");
-
-        if (cfg->upstreamUser[0] != '\0' && cfg->upstreamPass[0] != '\0')
-        {
-            int authCode = 0;
-            if (!smtp_authenticate_tls(ssl, cfg, reply, &authCode))
-            {
-                const char *authFail = (authCode == 530)
-                                           ? "530 Authentication required\r\n"
-                                           : "535 Authentication failed\r\n";
-                send_all_plain(clientSock, authFail, (int)strlen(authFail));
-                return false;
-            }
-            log_state_transition(cfg->logLevel, "AUTH_OK");
-        }
-        else
-        {
-            log_message(cfg->logLevel, "[SMTP] no upstream credentials configured");
-        }
+        return false;
     }
-
-    if (clientState.len > 0)
+    if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
     {
-        LineBuffer clientLog;
-        memset(&clientLog, 0, sizeof(clientLog));
-        log_lines_from_buffer(LOG_DEBUG, "C:", clientState.data, clientState.len,
-                              &clientLog, true);
-        if (!tls_send_all(ssl, clientState.data, clientState.len, cfg->logLevel))
-        {
-            return false;
-        }
-        clientState.len = 0;
+        return false;
     }
-
     return true;
 }
 
@@ -1521,127 +1544,173 @@ static DWORD WINAPI connection_thread(LPVOID param)
         mbedtls_ctr_drbg_context ctr_drbg;
         mbedtls_entropy_context entropy;
         mbedtls_x509_crt cacert;
+        bool tlsReady = false;
+        bool upstreamReady = false;
+        bool greeted = false;
 
-        if (!smtp_lazy_starttls(clientSock, &remoteSock, &cfg, &ssl, &conf,
-                                &ctr_drbg, &entropy, &cacert))
+        SmtpRecvBuffer clientState;
+        memset(&clientState, 0, sizeof(clientState));
+
+        for (;;)
         {
-            closesocket(clientSock);
-            return 0;
-        }
-
-        log_message(cfg.logLevel, "%s: STARTTLS completed", cfg.name);
-
-        DWORD lastActivity = GetTickCount();
-        char buffer[4096];
-        LineBuffer clientLineState;
-        LineBuffer serverLineState;
-        memset(&clientLineState, 0, sizeof(clientLineState));
-        memset(&serverLineState, 0, sizeof(serverLineState));
-
-        while (!g_shutdown)
-        {
-            DWORD now = GetTickCount();
-            if ((int)(now - lastActivity) > g_config.ioTimeoutMs)
-            {
-                log_message(cfg.logLevel, "%s: idle timeout", cfg.name);
-                break;
-            }
-
-            fd_set readSet;
-            FD_ZERO(&readSet);
-            FD_SET(clientSock, &readSet);
-            FD_SET(remoteSock, &readSet);
-            timeval tv;
-            tv.tv_sec = 1;
-            tv.tv_usec = 0;
-
-            int ret = select(0, &readSet, NULL, NULL, &tv);
-            if (ret == SOCKET_ERROR)
+            char line[1024];
+            int len = smtp_read_line_buffered(clientSock, line, sizeof(line),
+                                              g_config.ioTimeoutMs, &clientState);
+            if (len <= 0)
             {
                 break;
             }
-            if (ret == 0)
+            log_smtp_line(LOG_DEBUG, "C:", line);
+            log_client_command_state(cfg.logLevel, line);
+
+            if (_strnicmp(line, "EHLO", 4) == 0 || _strnicmp(line, "HELO", 4) == 0)
             {
+                const char *capabilities =
+                    "250-localhost\r\n"
+                    "250-PIPELINING\r\n"
+                    "250-8BITMIME\r\n"
+                    "250-SIZE 10485760\r\n"
+                    "250 HELP\r\n";
+                greeted = true;
+                if (!send_client_response(clientSock, capabilities))
+                {
+                    break;
+                }
                 continue;
             }
 
-            if (FD_ISSET(clientSock, &readSet))
+            if (_strnicmp(line, "NOOP", 4) == 0)
             {
-                int r = recv(clientSock, buffer, sizeof(buffer), 0);
-                if (r == 0)
+                if (!send_client_response(clientSock, "250 OK\r\n"))
                 {
-                    log_line("[L->APP]", "local client closed (recv=0)");
                     break;
                 }
-                if (r < 0)
-                {
-                    int wsaErr = WSAGetLastError();
-                    log_line("[L->APP]", "local recv failed: wsa=%d", wsaErr);
-                    break;
-                }
-                log_lines_from_buffer(LOG_DEBUG, "C:", buffer, r, &clientLineState, true);
-                int sent = 0;
-                while (sent < r)
-                {
-                    int w = mbedtls_ssl_write(&ssl, (const unsigned char *)buffer + sent, r - sent);
-                    if (w == MBEDTLS_ERR_SSL_WANT_READ || w == MBEDTLS_ERR_SSL_WANT_WRITE)
-                    {
-                        continue;
-                    }
-                    if (w <= 0)
-                    {
-                        char errbuf[256];
-                        mbedtls_strerror(w, errbuf, sizeof(errbuf));
-                        log_line("[TLS->R]", "TLS write to remote failed: ret=%d (-0x%04x) %s",
-                                 w, (unsigned int)(-w), errbuf);
-                        goto smtp_cleanup;
-                    }
-                    sent += w;
-                }
-                lastActivity = GetTickCount();
+                continue;
             }
 
-            if (FD_ISSET(remoteSock, &readSet))
+            if (_strnicmp(line, "RSET", 4) == 0)
             {
-                int r = mbedtls_ssl_read(&ssl, (unsigned char *)buffer, sizeof(buffer));
-                if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE)
+                if (upstreamReady)
                 {
-                    continue;
-                }
-                if (r == 0)
-                {
-                    log_line("[TLS<-R]", "TLS close_notify received");
-                    break;
-                }
-                if (r <= 0)
-                {
-                    char errbuf[256];
-                    mbedtls_strerror(r, errbuf, sizeof(errbuf));
-                    log_line("[TLS<-R]", "TLS read from remote failed: ret=%d (-0x%04x) %s",
-                             r, (unsigned int)(-r), errbuf);
-                    break;
-                }
-                log_lines_from_buffer(LOG_DEBUG, "S:", buffer, r, &serverLineState, false);
-                int sent = 0;
-                while (sent < r)
-                {
-                    int w = send(clientSock, buffer + sent, r - sent, 0);
-                    if (w <= 0)
+                    if (!tls_send_all(&ssl, line, len, cfg.logLevel))
                     {
-                        int wsaErr = WSAGetLastError();
-                        log_line("[APP->L]", "send to local client failed: wsa=%d", wsaErr);
-                        goto smtp_cleanup;
+                        break;
                     }
-                    sent += w;
+                    char reply[2048];
+                    if (!read_smtp_reply_tls(&ssl, reply, sizeof(reply), NULL, NULL,
+                                             g_config.ioTimeoutMs, LOG_DEBUG))
+                    {
+                        break;
+                    }
+                    if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+                    {
+                        break;
+                    }
                 }
-                lastActivity = GetTickCount();
+                else if (!send_client_response(clientSock, "250 OK\r\n"))
+                {
+                    break;
+                }
+                continue;
             }
+
+            if (_strnicmp(line, "QUIT", 4) == 0)
+            {
+                log_state_transition(cfg.logLevel, "QUIT");
+                send_client_response(clientSock, "221 Bye\r\n");
+                if (upstreamReady)
+                {
+                    tls_send_all(&ssl, "QUIT\r\n", 6, cfg.logLevel);
+                }
+                break;
+            }
+
+            if (_strnicmp(line, "STARTTLS", 8) == 0)
+            {
+                log_message(cfg.logLevel, "[SMTP] local STARTTLS requested but not available");
+                send_client_response(clientSock, "454 TLS not available\r\n");
+                continue;
+            }
+
+            if (!greeted)
+            {
+                if (!send_client_response(clientSock, "503 Send EHLO/HELO first\r\n"))
+                {
+                    break;
+                }
+                continue;
+            }
+
+            if (_strnicmp(line, "MAIL", 4) == 0 || _strnicmp(line, "RCPT", 4) == 0 ||
+                _strnicmp(line, "DATA", 4) == 0)
+            {
+                if (!upstreamReady)
+                {
+                    char ehloReply[2048];
+                    if (!smtp_connect_upstream(&cfg, &remoteSock, &ssl, &conf, &ctr_drbg,
+                                               &entropy, &cacert, ehloReply,
+                                               sizeof(ehloReply)))
+                    {
+                        send_client_response(clientSock, "451 Upstream unavailable\r\n");
+                        break;
+                    }
+                    tlsReady = true;
+                    upstreamReady = true;
+                }
+
+                if (_strnicmp(line, "MAIL", 4) == 0)
+                {
+                    log_state_transition(cfg.logLevel, "MAIL");
+                }
+                if (_strnicmp(line, "RCPT", 4) == 0)
+                {
+                    log_state_transition(cfg.logLevel, "RCPT");
+                }
+                if (_strnicmp(line, "DATA", 4) == 0)
+                {
+                    log_state_transition(cfg.logLevel, "DATA");
+                }
+
+                if (!tls_send_all(&ssl, line, len, cfg.logLevel))
+                {
+                    break;
+                }
+
+                if (_strnicmp(line, "DATA", 4) == 0)
+                {
+                    if (!smtp_handle_data(clientSock, &ssl, &cfg, &clientState))
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    char reply[2048];
+                    if (!read_smtp_reply_tls(&ssl, reply, sizeof(reply), NULL, NULL,
+                                             g_config.ioTimeoutMs, LOG_DEBUG))
+                    {
+                        break;
+                    }
+                    if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+                    {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            send_client_response(clientSock, "500 Command unrecognized\r\n");
         }
 
-smtp_cleanup:
-        tls_cleanup(&ssl, &conf, &ctr_drbg, &entropy, &cacert);
+        if (tlsReady)
+        {
+            tls_cleanup(&ssl, &conf, &ctr_drbg, &entropy, &cacert);
+        }
+        if (remoteSock != INVALID_SOCKET)
+        {
+            closesocket(remoteSock);
+        }
         closesocket(clientSock);
-        closesocket(remoteSock);
         return 0;
     }
 
@@ -1819,11 +1888,7 @@ static DWORD WINAPI listener_thread(LPVOID param)
         SOCKET remoteSock = INVALID_SOCKET;
         if (state->cfg.mode == MODE_STARTTLS_SMTP)
         {
-            const char *announce = state->cfg.announceName[0] != '\0'
-                                       ? state->cfg.announceName
-                                       : "localhost";
-            char banner[320];
-            snprintf(banner, sizeof(banner), "220 %s ESMTP TLSWrap98\r\n", announce);
+            const char *banner = "220 localhost TLSWrap98 ready\r\n";
             if (!send_all_plain(clientSock, banner, (int)strlen(banner)))
             {
                 closesocket(clientSock);
