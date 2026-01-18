@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <vector>
 #include <string.h>
+#include <ctype.h>
 
 
 
@@ -51,6 +52,7 @@ static int vc6_snprintf(char* dst, size_t dstSize, const char* fmt, ...)
 #define LOG_ERROR 0
 #define LOG_INFO 1
 #define LOG_DEBUG 2
+#define LOG_TRACE 5
 
 #define MAX_TUNNELS 32
 
@@ -58,6 +60,13 @@ enum TunnelMode
 {
     MODE_DIRECT_TLS = 0,
     MODE_STARTTLS_SMTP = 1
+};
+
+enum AuthMode
+{
+    AUTH_MODE_AUTO = 0,
+    AUTH_MODE_PLAIN = 1,
+    AUTH_MODE_LOGIN = 2
 };
 
 struct GlobalConfig
@@ -81,6 +90,9 @@ struct TunnelConfig
     int verifyCert;
     char sni[256];
     int logLevel;
+    char upstreamUser[128];
+    char upstreamPass[128];
+    AuthMode authMode;
 };
 
 struct TunnelState
@@ -194,6 +206,23 @@ static TunnelMode parse_mode(const char *mode)
     return MODE_DIRECT_TLS;
 }
 
+static AuthMode parse_auth_mode(const char *mode)
+{
+    if (!mode || mode[0] == '\0')
+    {
+        return AUTH_MODE_AUTO;
+    }
+    if (lstrcmpiA(mode, "plain") == 0)
+    {
+        return AUTH_MODE_PLAIN;
+    }
+    if (lstrcmpiA(mode, "login") == 0)
+    {
+        return AUTH_MODE_LOGIN;
+    }
+    return AUTH_MODE_AUTO;
+}
+
 static void load_global_config(const char *iniPath)
 {
     GetPrivateProfileStringA("global", "LogFile", g_config.logFile,
@@ -229,6 +258,15 @@ static void load_tunnel_config(const char *iniPath, const char *section, TunnelC
     cfg->mode = parse_mode(modeBuf);
 
     cfg->logLevel = GetPrivateProfileIntA(section, "LogLevel", g_config.logLevel, iniPath);
+
+    GetPrivateProfileStringA(section, "upstream_user", "",
+                             cfg->upstreamUser, sizeof(cfg->upstreamUser), iniPath);
+    GetPrivateProfileStringA(section, "upstream_pass", "",
+                             cfg->upstreamPass, sizeof(cfg->upstreamPass), iniPath);
+    char authModeBuf[32];
+    GetPrivateProfileStringA(section, "auth_mode", "auto",
+                             authModeBuf, sizeof(authModeBuf), iniPath);
+    cfg->authMode = parse_auth_mode(authModeBuf);
 }
 
 static void free_tunnels()
@@ -377,6 +415,401 @@ static int recv_line(SOCKET sock, char *buffer, int size, int timeoutMs)
     return total;
 }
 
+struct SmtpRecvBuffer
+{
+    char data[2048];
+    int len;
+};
+
+static int smtp_read_line_buffered(SOCKET sock, char *buffer, int size, int timeoutMs,
+                                   SmtpRecvBuffer *state)
+{
+    if (!state)
+    {
+        return recv_line(sock, buffer, size, timeoutMs);
+    }
+
+    DWORD start = GetTickCount();
+    for (;;)
+    {
+        int i;
+        for (i = 0; i < state->len; ++i)
+        {
+            if (state->data[i] == '\n')
+            {
+                int lineLen = i + 1;
+                int copyLen = lineLen < (size - 1) ? lineLen : (size - 1);
+                memcpy(buffer, state->data, copyLen);
+                buffer[copyLen] = '\0';
+                memmove(state->data, state->data + lineLen, state->len - lineLen);
+                state->len -= lineLen;
+                return copyLen;
+            }
+        }
+
+        if (state->len >= (int)sizeof(state->data))
+        {
+            return -1;
+        }
+
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(sock, &readSet);
+        timeval tv;
+        int remainMs = timeoutMs;
+        if (timeoutMs >= 0)
+        {
+            DWORD now = GetTickCount();
+            int elapsed = (int)(now - start);
+            remainMs = timeoutMs - elapsed;
+            if (remainMs <= 0)
+            {
+                return -1;
+            }
+        }
+        tv.tv_sec = remainMs / 1000;
+        tv.tv_usec = (remainMs % 1000) * 1000;
+        int ret = select(0, &readSet, NULL, NULL, &tv);
+        if (ret <= 0)
+        {
+            return -1;
+        }
+        int r = recv(sock, state->data + state->len,
+                     (int)sizeof(state->data) - state->len, 0);
+        if (r <= 0)
+        {
+            return -1;
+        }
+        state->len += r;
+    }
+}
+
+struct LineBuffer
+{
+    char data[1024];
+    int len;
+};
+
+static void log_smtp_line(int level, const char *prefix, const char *line)
+{
+    char clean[1024];
+    int i = 0;
+    while (line[i] != '\0' && i < (int)sizeof(clean) - 1)
+    {
+        if (line[i] == '\r' || line[i] == '\n')
+        {
+            break;
+        }
+        clean[i] = line[i];
+        ++i;
+    }
+    clean[i] = '\0';
+    log_message(level, "%s %s", prefix, clean);
+}
+
+static void log_state_transition(int level, const char *state)
+{
+    log_message(level, "[SMTP] STATE=%s", state);
+}
+
+static bool smtp_parse_code(const char *line, int *code, char *sep)
+{
+    if (!line || !isdigit((unsigned char)line[0]) || !isdigit((unsigned char)line[1]) ||
+        !isdigit((unsigned char)line[2]))
+    {
+        return false;
+    }
+    if (code)
+    {
+        *code = (line[0] - '0') * 100 + (line[1] - '0') * 10 + (line[2] - '0');
+    }
+    if (sep)
+    {
+        *sep = line[3];
+    }
+    return true;
+}
+
+static bool read_smtp_reply(SOCKET sock, char *out_buf, int out_cap, int *code,
+                            bool *is_multiline_complete, SmtpRecvBuffer *state,
+                            int timeoutMs, int logLevel)
+{
+    int total = 0;
+    int expectedCode = 0;
+    bool haveCode = false;
+    if (is_multiline_complete)
+    {
+        *is_multiline_complete = false;
+    }
+    for (;;)
+    {
+        char line[512];
+        int len = smtp_read_line_buffered(sock, line, sizeof(line), timeoutMs, state);
+        if (len <= 0)
+        {
+            return false;
+        }
+        log_smtp_line(logLevel, "S:", line);
+        if (total + len >= out_cap)
+        {
+            return false;
+        }
+        memcpy(out_buf + total, line, len);
+        total += len;
+        out_buf[total] = '\0';
+
+        int lineCode = 0;
+        char sep = '\0';
+        if (smtp_parse_code(line, &lineCode, &sep))
+        {
+            if (!haveCode)
+            {
+                expectedCode = lineCode;
+                haveCode = true;
+                if (code)
+                {
+                    *code = expectedCode;
+                }
+            }
+            if (haveCode && lineCode == expectedCode && sep == ' ')
+            {
+                if (is_multiline_complete)
+                {
+                    *is_multiline_complete = true;
+                }
+                return true;
+            }
+        }
+        if (!haveCode && len >= 4 && line[3] != '-')
+        {
+            if (is_multiline_complete)
+            {
+                *is_multiline_complete = true;
+            }
+            return true;
+        }
+    }
+}
+
+static bool read_smtp_reply_tls(mbedtls_ssl_context *ssl, char *out_buf, int out_cap, int *code,
+                                bool *is_multiline_complete, int timeoutMs, int logLevel)
+{
+    int total = 0;
+    int expectedCode = 0;
+    bool haveCode = false;
+    if (is_multiline_complete)
+    {
+        *is_multiline_complete = false;
+    }
+    for (;;)
+    {
+        char line[512];
+        int len = tls_recv_line(ssl, line, sizeof(line), timeoutMs);
+        if (len <= 0)
+        {
+            return false;
+        }
+        log_smtp_line(logLevel, "S:", line);
+        if (total + len >= out_cap)
+        {
+            return false;
+        }
+        memcpy(out_buf + total, line, len);
+        total += len;
+        out_buf[total] = '\0';
+
+        int lineCode = 0;
+        char sep = '\0';
+        if (smtp_parse_code(line, &lineCode, &sep))
+        {
+            if (!haveCode)
+            {
+                expectedCode = lineCode;
+                haveCode = true;
+                if (code)
+                {
+                    *code = expectedCode;
+                }
+            }
+            if (haveCode && lineCode == expectedCode && sep == ' ')
+            {
+                if (is_multiline_complete)
+                {
+                    *is_multiline_complete = true;
+                }
+                return true;
+            }
+        }
+        if (!haveCode && len >= 4 && line[3] != '-')
+        {
+            if (is_multiline_complete)
+            {
+                *is_multiline_complete = true;
+            }
+            return true;
+        }
+    }
+}
+
+static int base64_encode(const unsigned char *src, int srcLen, char *dst, int dstCap)
+{
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int outLen = 0;
+    int i;
+    for (i = 0; i < srcLen; i += 3)
+    {
+        unsigned int b0 = src[i];
+        unsigned int b1 = (i + 1 < srcLen) ? src[i + 1] : 0;
+        unsigned int b2 = (i + 2 < srcLen) ? src[i + 2] : 0;
+        unsigned int triple = (b0 << 16) | (b1 << 8) | b2;
+        if (outLen + 4 >= dstCap)
+        {
+            return -1;
+        }
+        dst[outLen++] = table[(triple >> 18) & 0x3f];
+        dst[outLen++] = table[(triple >> 12) & 0x3f];
+        dst[outLen++] = (i + 1 < srcLen) ? table[(triple >> 6) & 0x3f] : '=';
+        dst[outLen++] = (i + 2 < srcLen) ? table[triple & 0x3f] : '=';
+    }
+    if (outLen < dstCap)
+    {
+        dst[outLen] = '\0';
+    }
+    return outLen;
+}
+
+static const char *find_case_insensitive(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !needle[0])
+    {
+        return NULL;
+    }
+    size_t needleLen = strlen(needle);
+    for (; *haystack; ++haystack)
+    {
+        size_t i;
+        for (i = 0; i < needleLen; ++i)
+        {
+            char a = haystack[i];
+            char b = needle[i];
+            if (a == '\0')
+            {
+                return NULL;
+            }
+            if (tolower((unsigned char)a) != tolower((unsigned char)b))
+            {
+                break;
+            }
+        }
+        if (i == needleLen)
+        {
+            return haystack;
+        }
+    }
+    return NULL;
+}
+
+static void parse_auth_caps(const char *reply, bool *hasPlain, bool *hasLogin)
+{
+    if (hasPlain)
+    {
+        *hasPlain = false;
+    }
+    if (hasLogin)
+    {
+        *hasLogin = false;
+    }
+    if (!reply)
+    {
+        return;
+    }
+    const char *ptr = reply;
+    while (*ptr)
+    {
+        const char *lineEnd = strstr(ptr, "\n");
+        int lineLen = lineEnd ? (int)(lineEnd - ptr) + 1 : (int)strlen(ptr);
+        char line[512];
+        int copyLen = lineLen < (int)sizeof(line) - 1 ? lineLen : (int)sizeof(line) - 1;
+        memcpy(line, ptr, copyLen);
+        line[copyLen] = '\0';
+        if (find_case_insensitive(line, "AUTH"))
+        {
+            if (hasPlain && find_case_insensitive(line, "PLAIN"))
+            {
+                *hasPlain = true;
+            }
+            if (hasLogin && find_case_insensitive(line, "LOGIN"))
+            {
+                *hasLogin = true;
+            }
+        }
+        if (!lineEnd)
+        {
+            break;
+        }
+        ptr = lineEnd + 1;
+    }
+}
+
+static void log_client_command_state(int level, const char *line)
+{
+    if (!line)
+    {
+        return;
+    }
+    if (_strnicmp(line, "EHLO", 4) == 0 || _strnicmp(line, "HELO", 4) == 0)
+    {
+        log_state_transition(level, "EHLO");
+    }
+    else if (_strnicmp(line, "MAIL", 4) == 0)
+    {
+        log_state_transition(level, "MAIL");
+    }
+    else if (_strnicmp(line, "RCPT", 4) == 0)
+    {
+        log_state_transition(level, "RCPT");
+    }
+    else if (_strnicmp(line, "DATA", 4) == 0)
+    {
+        log_state_transition(level, "DATA");
+    }
+    else if (_strnicmp(line, "QUIT", 4) == 0)
+    {
+        log_state_transition(level, "QUIT");
+    }
+    else if (line[0] == '.' && (line[1] == '\r' || line[1] == '\n' || line[1] == '\0'))
+    {
+        log_state_transition(level, "DOT");
+    }
+}
+
+static void log_lines_from_buffer(int level, const char *prefix, const char *data, int len,
+                                  LineBuffer *state, bool checkClientCommands)
+{
+    if (!state || !data || len <= 0)
+    {
+        return;
+    }
+    int i;
+    for (i = 0; i < len; ++i)
+    {
+        if (state->len < (int)sizeof(state->data) - 1)
+        {
+            state->data[state->len++] = data[i];
+        }
+        if (data[i] == '\n')
+        {
+            state->data[state->len] = '\0';
+            log_smtp_line(level, prefix, state->data);
+            if (checkClientCommands)
+            {
+                log_client_command_state(level, state->data);
+            }
+            state->len = 0;
+        }
+    }
+}
+
 static int tls_recv_line(mbedtls_ssl_context *ssl, char *buffer, int size, int timeoutMs)
 {
     int total = 0;
@@ -430,53 +863,35 @@ static bool send_all_plain(SOCKET sock, const char *buffer, int length)
     return true;
 }
 
-static bool smtp_discard_banner(SOCKET sock, int timeoutMs)
+static bool smtp_discard_banner(SOCKET sock, int timeoutMs, int logLevel, SmtpRecvBuffer *state)
 {
-    char line[512];
-    for (;;)
+    char reply[1024];
+    int code = 0;
+    if (!read_smtp_reply(sock, reply, sizeof(reply), &code, NULL, state, timeoutMs, logLevel))
     {
-        int len = recv_line(sock, line, sizeof(line), timeoutMs);
-        if (len <= 0)
-        {
-            return false;
-        }
-        if (len >= 4 && line[3] == '-')
-        {
-            continue;
-        }
-        break;
+        return false;
     }
     return true;
 }
 
-static bool smtp_forward_response(SOCKET remoteSock, SOCKET clientSock, int timeoutMs, bool *gotOk)
+static bool smtp_forward_response(SOCKET remoteSock, SOCKET clientSock, int timeoutMs, bool *gotOk,
+                                  int logLevel, SmtpRecvBuffer *state)
 {
-    char line[512];
-    bool ok = false;
-    for (;;)
+    char reply[2048];
+    int code = 0;
+    bool complete = false;
+    if (!read_smtp_reply(remoteSock, reply, sizeof(reply), &code, &complete,
+                         state, timeoutMs, logLevel))
     {
-        int len = recv_line(remoteSock, line, sizeof(line), timeoutMs);
-        if (len <= 0)
-        {
-            return false;
-        }
-        if (!send_all_plain(clientSock, line, len))
-        {
-            return false;
-        }
-        if (len >= 4 && line[3] == '-')
-        {
-            continue;
-        }
-        if (strncmp(line, "250", 3) == 0)
-        {
-            ok = true;
-        }
-        break;
+        return false;
+    }
+    if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+    {
+        return false;
     }
     if (gotOk)
     {
-        *gotOk = ok;
+        *gotOk = (code == 250);
     }
     return true;
 }
@@ -642,18 +1057,268 @@ static void tls_cleanup(mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
     mbedtls_x509_crt_free(cacert);
 }
 
+static bool tls_send_all(mbedtls_ssl_context *ssl, const char *buffer, int length, int logLevel)
+{
+    int sent = 0;
+    while (sent < length)
+    {
+        int w = mbedtls_ssl_write(ssl, (const unsigned char *)buffer + sent, length - sent);
+        if (w == MBEDTLS_ERR_SSL_WANT_READ || w == MBEDTLS_ERR_SSL_WANT_WRITE)
+        {
+            continue;
+        }
+        if (w <= 0)
+        {
+            char errbuf[256];
+            mbedtls_strerror(w, errbuf, sizeof(errbuf));
+            log_message(logLevel, "[SMTP] TLS write failed: ret=%d (-0x%04x) %s",
+                        w, (unsigned int)(-w), errbuf);
+            return false;
+        }
+        sent += w;
+    }
+    return true;
+}
+
+static bool smtp_authenticate_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
+                                  const char *ehloReply, int *authCode)
+{
+    if (authCode)
+    {
+        *authCode = 0;
+    }
+    bool hasPlain = false;
+    bool hasLogin = false;
+    parse_auth_caps(ehloReply, &hasPlain, &hasLogin);
+
+    AuthMode mode = cfg->authMode;
+    if (mode == AUTH_MODE_AUTO)
+    {
+        if (hasPlain)
+        {
+            mode = AUTH_MODE_PLAIN;
+        }
+        else if (hasLogin)
+        {
+            mode = AUTH_MODE_LOGIN;
+        }
+    }
+
+    if (mode == AUTH_MODE_AUTO)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH not offered by upstream");
+        return false;
+    }
+    if (mode == AUTH_MODE_PLAIN && !hasPlain)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH PLAIN not offered by upstream");
+        return false;
+    }
+    if (mode == AUTH_MODE_LOGIN && !hasLogin)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN not offered by upstream");
+        return false;
+    }
+
+    if (cfg->upstreamUser[0] == '\0' || cfg->upstreamPass[0] == '\0')
+    {
+        log_message(cfg->logLevel, "[SMTP] missing upstream_user or upstream_pass");
+        return false;
+    }
+
+    if (mode == AUTH_MODE_PLAIN)
+    {
+        unsigned char plainBuf[512];
+        int plainLen = 0;
+        plainBuf[plainLen++] = '\0';
+        strncpy((char *)plainBuf + plainLen, cfg->upstreamUser,
+                sizeof(plainBuf) - plainLen - 1);
+        plainLen += (int)strlen(cfg->upstreamUser);
+        plainBuf[plainLen++] = '\0';
+        strncpy((char *)plainBuf + plainLen, cfg->upstreamPass,
+                sizeof(plainBuf) - plainLen - 1);
+        plainLen += (int)strlen(cfg->upstreamPass);
+        plainBuf[plainLen] = '\0';
+
+        char encoded[1024];
+        if (base64_encode(plainBuf, plainLen, encoded, sizeof(encoded)) <= 0)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH PLAIN base64 encode failed");
+            return false;
+        }
+
+        char cmd[1200];
+        snprintf(cmd, sizeof(cmd), "AUTH PLAIN %s\r\n", encoded);
+        log_message(cfg->logLevel, "[SMTP] AUTH PLAIN sent");
+        if (!tls_send_all(ssl, cmd, (int)strlen(cmd), cfg->logLevel))
+        {
+            return false;
+        }
+
+        char reply[1024];
+        int code = 0;
+        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                                 g_config.ioTimeoutMs, cfg->logLevel))
+        {
+            return false;
+        }
+        if (code == 235)
+        {
+            if (authCode)
+            {
+                *authCode = code;
+            }
+            return true;
+        }
+        if (code == 530)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH rejected with 530");
+        }
+        else
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH rejected (code=%d)", code);
+        }
+        if (authCode)
+        {
+            *authCode = code;
+        }
+        return false;
+    }
+
+    if (mode == AUTH_MODE_LOGIN)
+    {
+        const char *cmd = "AUTH LOGIN\r\n";
+        log_message(cfg->logLevel, "[SMTP] AUTH LOGIN sent");
+        if (!tls_send_all(ssl, cmd, (int)strlen(cmd), cfg->logLevel))
+        {
+            return false;
+        }
+        char reply[1024];
+        int code = 0;
+        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                                 g_config.ioTimeoutMs, cfg->logLevel))
+        {
+            return false;
+        }
+        if (code != 334)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN not accepted (code=%d)", code);
+            if (authCode)
+            {
+                *authCode = code;
+            }
+            return false;
+        }
+
+        char encodedUser[256];
+        if (base64_encode((const unsigned char *)cfg->upstreamUser,
+                          (int)strlen(cfg->upstreamUser),
+                          encodedUser, sizeof(encodedUser)) <= 0)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN user encode failed");
+            return false;
+        }
+        char userCmd[300];
+        snprintf(userCmd, sizeof(userCmd), "%s\r\n", encodedUser);
+        if (!tls_send_all(ssl, userCmd, (int)strlen(userCmd), cfg->logLevel))
+        {
+            return false;
+        }
+        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                                 g_config.ioTimeoutMs, cfg->logLevel))
+        {
+            return false;
+        }
+        if (code != 334)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN user rejected (code=%d)", code);
+            if (authCode)
+            {
+                *authCode = code;
+            }
+            return false;
+        }
+
+        char encodedPass[256];
+        if (base64_encode((const unsigned char *)cfg->upstreamPass,
+                          (int)strlen(cfg->upstreamPass),
+                          encodedPass, sizeof(encodedPass)) <= 0)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN pass encode failed");
+            return false;
+        }
+        char passCmd[300];
+        snprintf(passCmd, sizeof(passCmd), "%s\r\n", encodedPass);
+        if (!tls_send_all(ssl, passCmd, (int)strlen(passCmd), cfg->logLevel))
+        {
+            return false;
+        }
+        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                                 g_config.ioTimeoutMs, cfg->logLevel))
+        {
+            return false;
+        }
+        if (code == 235)
+        {
+            if (authCode)
+            {
+                *authCode = code;
+            }
+            return true;
+        }
+        if (code == 530)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN rejected with 530");
+        }
+        else
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN rejected (code=%d)", code);
+        }
+        if (authCode)
+        {
+            *authCode = code;
+        }
+        return false;
+    }
+
+    return false;
+}
+
 static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelConfig *cfg,
                                mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
                                mbedtls_ctr_drbg_context *ctr_drbg, mbedtls_entropy_context *entropy,
                                mbedtls_x509_crt *cacert)
 {
+    /*
+    Expected transcript (local client is plaintext, upstream is TLS after STARTTLS):
+      S: 220 relay.example ESMTP TLSWrap98
+      C: EHLO local
+      S: 250-relay.example Hello
+      S: 250-STARTTLS
+      S: 250 AUTH PLAIN LOGIN
+      C: STARTTLS
+      S: 220 Ready to start TLS
+      (TLS handshake with upstream)
+      S: 250-relay.example Hello (post-TLS)
+      S: 250 AUTH PLAIN LOGIN
+      (AUTH PLAIN/LOGIN upstream)
+      C: MAIL FROM:<user@example>
+      S: 250 OK
+    */
     char line[512];
-    int len = recv_line(clientSock, line, sizeof(line), g_config.ioTimeoutMs);
+    SmtpRecvBuffer clientState;
+    SmtpRecvBuffer remoteState;
+    memset(&clientState, 0, sizeof(clientState));
+    memset(&remoteState, 0, sizeof(remoteState));
+
+    int len = smtp_read_line_buffered(clientSock, line, sizeof(line),
+                                      g_config.ioTimeoutMs, &clientState);
     if (len <= 0)
     {
         log_line("[SMTP]", "local client closed before command");
         return false;
     }
+    log_smtp_line(LOG_DEBUG, "C:", line);
 
     SOCKET rs = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
                                      g_config.connectTimeoutMs);
@@ -664,7 +1329,10 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
     }
     *remoteSockOut = rs;
 
-    if (!smtp_discard_banner(*remoteSockOut, g_config.startTlsTimeoutMs))
+    log_state_transition(cfg->logLevel, "CONNECT");
+
+    if (!smtp_discard_banner(*remoteSockOut, g_config.startTlsTimeoutMs,
+                             LOG_DEBUG, &remoteState))
     {
         log_message(cfg->logLevel, "[SMTP] failed to read remote banner");
         closesocket(*remoteSockOut);
@@ -679,13 +1347,15 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
     {
         if (!haveLine)
         {
-            len = recv_line(clientSock, line, sizeof(line), g_config.ioTimeoutMs);
+            len = smtp_read_line_buffered(clientSock, line, sizeof(line),
+                                          g_config.ioTimeoutMs, &clientState);
             if (len <= 0)
             {
                 closesocket(*remoteSockOut);
                 *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
+            log_smtp_line(LOG_DEBUG, "C:", line);
         }
         haveLine = false;
 
@@ -698,7 +1368,13 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
         }
 
         bool gotOk = false;
-        if (!smtp_forward_response(*remoteSockOut, clientSock, g_config.startTlsTimeoutMs, &gotOk))
+        if (isEhlo)
+        {
+            log_state_transition(cfg->logLevel, "EHLO");
+        }
+
+        if (!smtp_forward_response(*remoteSockOut, clientSock, g_config.startTlsTimeoutMs,
+                                   &gotOk, LOG_DEBUG, &remoteState))
         {
             closesocket(*remoteSockOut);
             *remoteSockOut = INVALID_SOCKET;
@@ -714,10 +1390,26 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
                 *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
-            len = recv_line(*remoteSockOut, line, sizeof(line), g_config.startTlsTimeoutMs);
-            if (len <= 0 || strncmp(line, "220", 3) != 0)
+            log_state_transition(cfg->logLevel, "STARTTLS");
+            char reply[1024];
+            int code = 0;
+            if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
+                                 &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
             {
-                log_message(cfg->logLevel, "[SMTP] STARTTLS rejected: %s", line);
+                log_message(cfg->logLevel, "[SMTP] STARTTLS no response");
+                closesocket(*remoteSockOut);
+                *remoteSockOut = INVALID_SOCKET;
+                return false;
+            }
+            if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+            {
+                closesocket(*remoteSockOut);
+                *remoteSockOut = INVALID_SOCKET;
+                return false;
+            }
+            if (code != 220)
+            {
+                log_message(cfg->logLevel, "[SMTP] STARTTLS rejected (code=%d)", code);
                 closesocket(*remoteSockOut);
                 *remoteSockOut = INVALID_SOCKET;
                 return false;
@@ -729,7 +1421,7 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
                 *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
-            log_message(cfg->logLevel, "[SMTP] upstream TLS handshake OK");
+            log_state_transition(cfg->logLevel, "TLS_OK");
             upgraded = true;
         }
     }
@@ -737,48 +1429,57 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
     if (upgraded)
     {
         const char *postEhlo = "EHLO localhost\r\n";
-        int sent = 0;
-        int postLen = (int)strlen(postEhlo);
-        while (sent < postLen)
+        if (!tls_send_all(ssl, postEhlo, (int)strlen(postEhlo), cfg->logLevel))
         {
-            int w = mbedtls_ssl_write(ssl, (const unsigned char *)postEhlo + sent, postLen - sent);
-            if (w == MBEDTLS_ERR_SSL_WANT_READ || w == MBEDTLS_ERR_SSL_WANT_WRITE)
-            {
-                continue;
-            }
-            if (w <= 0)
-            {
-                log_message(cfg->logLevel, "[SMTP] post-TLS EHLO write failed: %d", w);
-                return false;
-            }
-            sent += w;
-        }
-
-        bool gotOk = false;
-        for (;;)
-        {
-            len = tls_recv_line(ssl, line, sizeof(line), g_config.startTlsTimeoutMs);
-            if (len <= 0)
-            {
-                log_message(cfg->logLevel, "[SMTP] post-TLS EHLO read failed");
-                return false;
-            }
-            if (strncmp(line, "250", 3) == 0)
-            {
-                gotOk = true;
-            }
-            if (len >= 4 && line[3] == '-')
-            {
-                continue;
-            }
-            break;
-        }
-        if (!gotOk)
-        {
-            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO rejected: %s", line);
+            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO write failed");
             return false;
         }
-        log_message(cfg->logLevel, "[SMTP] sent post-TLS EHLO upstream and got 250");
+
+        char reply[2048];
+        int code = 0;
+        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                                 g_config.startTlsTimeoutMs, LOG_DEBUG))
+        {
+            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO read failed");
+            return false;
+        }
+        if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+        {
+            return false;
+        }
+        if (code != 250)
+        {
+            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO rejected (code=%d)", code);
+            return false;
+        }
+        log_state_transition(cfg->logLevel, "EHLO2");
+
+        if (cfg->remotePort == 587)
+        {
+            int authCode = 0;
+            if (!smtp_authenticate_tls(ssl, cfg, reply, &authCode))
+            {
+                const char *authFail = (authCode == 530)
+                                           ? "530 Authentication required\r\n"
+                                           : "535 Authentication failed\r\n";
+                send_all_plain(clientSock, authFail, (int)strlen(authFail));
+                return false;
+            }
+            log_state_transition(cfg->logLevel, "AUTH_OK");
+        }
+    }
+
+    if (clientState.len > 0)
+    {
+        LineBuffer clientLog;
+        memset(&clientLog, 0, sizeof(clientLog));
+        log_lines_from_buffer(LOG_DEBUG, "C:", clientState.data, clientState.len,
+                              &clientLog, true);
+        if (!tls_send_all(ssl, clientState.data, clientState.len, cfg->logLevel))
+        {
+            return false;
+        }
+        clientState.len = 0;
     }
 
     return true;
@@ -811,6 +1512,10 @@ static DWORD WINAPI connection_thread(LPVOID param)
 
         DWORD lastActivity = GetTickCount();
         char buffer[4096];
+        LineBuffer clientLineState;
+        LineBuffer serverLineState;
+        memset(&clientLineState, 0, sizeof(clientLineState));
+        memset(&serverLineState, 0, sizeof(serverLineState));
 
         while (!g_shutdown)
         {
@@ -853,6 +1558,7 @@ static DWORD WINAPI connection_thread(LPVOID param)
                     log_line("[L->APP]", "local recv failed: wsa=%d", wsaErr);
                     break;
                 }
+                log_lines_from_buffer(LOG_DEBUG, "C:", buffer, r, &clientLineState, true);
                 int sent = 0;
                 while (sent < r)
                 {
@@ -894,6 +1600,7 @@ static DWORD WINAPI connection_thread(LPVOID param)
                              r, (unsigned int)(-r), errbuf);
                     break;
                 }
+                log_lines_from_buffer(LOG_DEBUG, "S:", buffer, r, &serverLineState, false);
                 int sent = 0;
                 while (sent < r)
                 {
