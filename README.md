@@ -16,7 +16,7 @@ Outlook / Legacy Client (plaintext SMTP)
             v
      TLSWrap98 (localhost)
             |
-            v
+            v 
    STARTTLS + AUTH (TLS 1.2)
             |
             v
