@@ -377,6 +377,44 @@ static int recv_line(SOCKET sock, char *buffer, int size, int timeoutMs)
     return total;
 }
 
+static int tls_recv_line(mbedtls_ssl_context *ssl, char *buffer, int size, int timeoutMs)
+{
+    int total = 0;
+    DWORD start = GetTickCount();
+    while (total < size - 1)
+    {
+        int ret = mbedtls_ssl_read(ssl, (unsigned char *)buffer + total, 1);
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+        {
+            if (timeoutMs >= 0)
+            {
+                DWORD now = GetTickCount();
+                if ((int)(now - start) > timeoutMs)
+                {
+                    return -1;
+                }
+            }
+            Sleep(1);
+            continue;
+        }
+        if (ret == 0)
+        {
+            return 0;
+        }
+        if (ret < 0)
+        {
+            return -1;
+        }
+        total += ret;
+        if (buffer[total - 1] == '\n')
+        {
+            break;
+        }
+    }
+    buffer[total] = '\0';
+    return total;
+}
+
 static bool send_all_plain(SOCKET sock, const char *buffer, int length)
 {
     int sent = 0;
@@ -669,7 +707,7 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
 
         if (isEhlo && gotOk)
         {
-            log_message(cfg->logLevel, "[SMTP] relayed EHLO, now upgrading upstream via STARTTLS");
+            log_message(cfg->logLevel, "[SMTP] relayed client EHLO/HELO");
             if (!send_all_plain(*remoteSockOut, "STARTTLS\r\n", 10))
             {
                 closesocket(*remoteSockOut);
@@ -684,6 +722,7 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
                 *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
+            log_message(cfg->logLevel, "[SMTP] upstream STARTTLS accepted");
             if (!tls_handshake(remoteSockOut, cfg, ssl, conf, ctr_drbg, entropy, cacert))
             {
                 closesocket(*remoteSockOut);
@@ -693,6 +732,53 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
             log_message(cfg->logLevel, "[SMTP] upstream TLS handshake OK");
             upgraded = true;
         }
+    }
+
+    if (upgraded)
+    {
+        const char *postEhlo = "EHLO localhost\r\n";
+        int sent = 0;
+        int postLen = (int)strlen(postEhlo);
+        while (sent < postLen)
+        {
+            int w = mbedtls_ssl_write(ssl, (const unsigned char *)postEhlo + sent, postLen - sent);
+            if (w == MBEDTLS_ERR_SSL_WANT_READ || w == MBEDTLS_ERR_SSL_WANT_WRITE)
+            {
+                continue;
+            }
+            if (w <= 0)
+            {
+                log_message(cfg->logLevel, "[SMTP] post-TLS EHLO write failed: %d", w);
+                return false;
+            }
+            sent += w;
+        }
+
+        bool gotOk = false;
+        for (;;)
+        {
+            len = tls_recv_line(ssl, line, sizeof(line), g_config.startTlsTimeoutMs);
+            if (len <= 0)
+            {
+                log_message(cfg->logLevel, "[SMTP] post-TLS EHLO read failed");
+                return false;
+            }
+            if (strncmp(line, "250", 3) == 0)
+            {
+                gotOk = true;
+            }
+            if (len >= 4 && line[3] == '-')
+            {
+                continue;
+            }
+            break;
+        }
+        if (!gotOk)
+        {
+            log_message(cfg->logLevel, "[SMTP] post-TLS EHLO rejected: %s", line);
+            return false;
+        }
+        log_message(cfg->logLevel, "[SMTP] sent post-TLS EHLO upstream and got 250");
     }
 
     return true;
