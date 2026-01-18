@@ -871,6 +871,22 @@ struct SmtpRecvBuffer
     int len;
 };
 
+enum
+{
+    SMTP_MAX_BUFFERED_RCPT = 32
+};
+
+struct SmtpSession
+{
+    bool upstreamConnected;
+    bool upstreamTlsOk;
+    bool upstreamAuthed;
+    bool haveBufferedMailFrom;
+    char bufferedMailFrom[512];
+    int bufferedRcptCount;
+    char bufferedRcpt[SMTP_MAX_BUFFERED_RCPT][512];
+};
+
 static int smtp_read_line_buffered(SOCKET sock, char *buffer, int size, int timeoutMs,
                                    SmtpRecvBuffer *state)
 {
@@ -1161,6 +1177,21 @@ static const char *find_case_insensitive(const char *haystack, const char *needl
     return NULL;
 }
 
+static bool smtp_host_prefers_login(const char *host)
+{
+    if (!host)
+    {
+        return false;
+    }
+    if (find_case_insensitive(host, "tlen") ||
+        find_case_insensitive(host, "wp") ||
+        find_case_insensitive(host, "o2"))
+    {
+        return true;
+    }
+    return false;
+}
+
 static void parse_auth_caps(const char *reply, bool *hasPlain, bool *hasLogin)
 {
     if (hasPlain)
@@ -1201,6 +1232,44 @@ static void parse_auth_caps(const char *reply, bool *hasPlain, bool *hasLogin)
         }
         ptr = lineEnd + 1;
     }
+}
+
+static void smtp_session_init(SmtpSession *session)
+{
+    if (!session)
+    {
+        return;
+    }
+    memset(session, 0, sizeof(*session));
+}
+
+static bool smtp_buffer_mail_from(SmtpSession *session, const char *line)
+{
+    if (!session || !line)
+    {
+        return false;
+    }
+    strncpy(session->bufferedMailFrom, line, sizeof(session->bufferedMailFrom) - 1);
+    session->bufferedMailFrom[sizeof(session->bufferedMailFrom) - 1] = '\0';
+    session->haveBufferedMailFrom = true;
+    return true;
+}
+
+static bool smtp_buffer_rcpt(SmtpSession *session, const char *line)
+{
+    if (!session || !line)
+    {
+        return false;
+    }
+    if (session->bufferedRcptCount >= SMTP_MAX_BUFFERED_RCPT)
+    {
+        return false;
+    }
+    strncpy(session->bufferedRcpt[session->bufferedRcptCount], line,
+            sizeof(session->bufferedRcpt[session->bufferedRcptCount]) - 1);
+    session->bufferedRcpt[session->bufferedRcptCount][sizeof(session->bufferedRcpt[session->bufferedRcptCount]) - 1] = '\0';
+    session->bufferedRcptCount++;
+    return true;
 }
 
 static bool parse_starttls_cap(const char *reply)
@@ -1569,6 +1638,44 @@ static bool tls_send_all(mbedtls_ssl_context *ssl, const char *buffer, int lengt
     return true;
 }
 
+static bool smtp_auth_plain_response_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
+                                         const char *encoded, int *authCode)
+{
+    if (!tls_send_all(ssl, encoded, (int)strlen(encoded), cfg->logLevel))
+    {
+        return false;
+    }
+    if (!tls_send_all(ssl, "\r\n", 2, cfg->logLevel))
+    {
+        return false;
+    }
+
+    char reply[1024];
+    int code = 0;
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                             g_config.ioTimeoutMs, cfg->logLevel))
+    {
+        return false;
+    }
+    if (authCode)
+    {
+        *authCode = code;
+    }
+    if (code == 235)
+    {
+        return true;
+    }
+    if (code == 530)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH rejected with 530");
+    }
+    else
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH rejected (code=%d)", code);
+    }
+    return false;
+}
+
 static bool smtp_auth_plain_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg, int *authCode)
 {
     if (authCode)
@@ -1610,6 +1717,11 @@ static bool smtp_auth_plain_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg, int
     {
         return false;
     }
+    if (code == 334)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH PLAIN challenge received");
+        return smtp_auth_plain_response_tls(ssl, cfg, encoded, authCode);
+    }
     if (authCode)
     {
         *authCode = code;
@@ -1617,6 +1729,31 @@ static bool smtp_auth_plain_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg, int
     if (code == 235)
     {
         return true;
+    }
+    if (code == 500 || code == 501 || code == 504)
+    {
+        log_message(cfg->logLevel, "[SMTP] AUTH PLAIN retrying with two-step flow");
+        const char *stepCmd = "AUTH PLAIN\r\n";
+        if (!tls_send_all(ssl, stepCmd, (int)strlen(stepCmd), cfg->logLevel))
+        {
+            return false;
+        }
+        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                                 g_config.ioTimeoutMs, cfg->logLevel))
+        {
+            return false;
+        }
+        if (code != 334)
+        {
+            if (authCode)
+            {
+                *authCode = code;
+            }
+            log_message(cfg->logLevel, "[SMTP] AUTH PLAIN not accepted (code=%d)", code);
+            return false;
+        }
+        log_message(cfg->logLevel, "[SMTP] AUTH PLAIN challenge received");
+        return smtp_auth_plain_response_tls(ssl, cfg, encoded, authCode);
     }
     if (code == 530)
     {
@@ -1659,6 +1796,7 @@ static bool smtp_auth_login_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg, int
         }
         return false;
     }
+    log_message(cfg->logLevel, "[SMTP] AUTH LOGIN got username prompt");
 
     char encodedUser[256];
     if (base64_encode((const unsigned char *)cfg->upstreamUser,
@@ -1688,6 +1826,7 @@ static bool smtp_auth_login_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg, int
         }
         return false;
     }
+    log_message(cfg->logLevel, "[SMTP] AUTH LOGIN got password prompt");
 
     char encodedPass[256];
     if (base64_encode((const unsigned char *)cfg->upstreamPass,
@@ -1741,7 +1880,12 @@ static bool smtp_authenticate_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
     AuthMode mode = cfg->authMode;
     if (mode == AUTH_MODE_AUTO)
     {
-        if (hasPlain)
+        bool preferLogin = smtp_host_prefers_login(cfg->remoteHost);
+        if (preferLogin && hasLogin)
+        {
+            mode = AUTH_MODE_LOGIN;
+        }
+        else if (hasPlain)
         {
             mode = AUTH_MODE_PLAIN;
         }
@@ -1775,12 +1919,34 @@ static bool smtp_authenticate_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
 
     if (mode == AUTH_MODE_PLAIN)
     {
-        return smtp_auth_plain_tls(ssl, cfg, authCode);
+        log_message(cfg->logLevel, "[SMTP] starting upstream AUTH (PLAIN)");
+        if (smtp_auth_plain_tls(ssl, cfg, authCode))
+        {
+            return true;
+        }
+        if (cfg->authMode == AUTH_MODE_AUTO && hasLogin && authCode && *authCode == 535)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH PLAIN failed, retrying with LOGIN");
+            log_message(cfg->logLevel, "[SMTP] starting upstream AUTH (LOGIN)");
+            return smtp_auth_login_tls(ssl, cfg, authCode);
+        }
+        return false;
     }
 
     if (mode == AUTH_MODE_LOGIN)
     {
-        return smtp_auth_login_tls(ssl, cfg, authCode);
+        log_message(cfg->logLevel, "[SMTP] starting upstream AUTH (LOGIN)");
+        if (smtp_auth_login_tls(ssl, cfg, authCode))
+        {
+            return true;
+        }
+        if (cfg->authMode == AUTH_MODE_AUTO && hasPlain && authCode && *authCode == 535)
+        {
+            log_message(cfg->logLevel, "[SMTP] AUTH LOGIN failed, retrying with PLAIN");
+            log_message(cfg->logLevel, "[SMTP] starting upstream AUTH (PLAIN)");
+            return smtp_auth_plain_tls(ssl, cfg, authCode);
+        }
+        return false;
     }
 
     return false;
@@ -1879,15 +2045,91 @@ static bool smtp_build_mail_from_line(const char *line, const char *forced,
     return true;
 }
 
+static bool smtp_send_and_forward_reply(SOCKET clientSock, mbedtls_ssl_context *ssl,
+                                        const char *line, int len, int logLevel, int timeoutMs)
+{
+    if (!tls_send_all(ssl, line, len, logLevel))
+    {
+        return false;
+    }
+    char reply[2048];
+    if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), NULL, NULL, timeoutMs, LOG_DEBUG))
+    {
+        return false;
+    }
+    if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool smtp_replay_buffered_commands(SmtpSession *session, SOCKET clientSock,
+                                          mbedtls_ssl_context *ssl, TunnelConfig *cfg)
+{
+    if (!session || !cfg)
+    {
+        return false;
+    }
+
+    if (session->haveBufferedMailFrom)
+    {
+        log_message(cfg->logLevel, "[SMTP] replaying buffered MAIL FROM");
+        char mailLine[512];
+        const char *forcedMailFrom = smtp_force_mail_from(cfg);
+        if (forcedMailFrom &&
+            smtp_build_mail_from_line(session->bufferedMailFrom, forcedMailFrom,
+                                      mailLine, sizeof(mailLine)))
+        {
+            log_message(cfg->logLevel, "[SMTP] MAIL FROM rewritten to %s", forcedMailFrom);
+        }
+        else
+        {
+            strncpy(mailLine, session->bufferedMailFrom, sizeof(mailLine) - 1);
+            mailLine[sizeof(mailLine) - 1] = '\0';
+        }
+        if (!smtp_send_and_forward_reply(clientSock, ssl, mailLine,
+                                         (int)strlen(mailLine), cfg->logLevel,
+                                         g_config.ioTimeoutMs))
+        {
+            return false;
+        }
+        session->haveBufferedMailFrom = false;
+    }
+
+    if (session->bufferedRcptCount > 0)
+    {
+        int i;
+        log_message(cfg->logLevel, "[SMTP] replaying buffered RCPT");
+        for (i = 0; i < session->bufferedRcptCount; ++i)
+        {
+            const char *rcptLine = session->bufferedRcpt[i];
+            if (!smtp_send_and_forward_reply(clientSock, ssl, rcptLine,
+                                             (int)strlen(rcptLine), cfg->logLevel,
+                                             g_config.ioTimeoutMs))
+            {
+                return false;
+            }
+        }
+        session->bufferedRcptCount = 0;
+    }
+
+    return true;
+}
+
 static bool smtp_connect_upstream(TunnelConfig *cfg, SOCKET *remoteSockOut,
                                   mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
                                   mbedtls_ctr_drbg_context *ctr_drbg,
                                   mbedtls_entropy_context *entropy, mbedtls_x509_crt *cacert,
-                                  char *ehloReply, int ehloReplyCap)
+                                  char *ehloReply, int ehloReplyCap, int *authCodeOut)
 {
     if (!cfg || !remoteSockOut)
     {
         return false;
+    }
+    if (authCodeOut)
+    {
+        *authCodeOut = 0;
     }
 
     *remoteSockOut = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
@@ -2013,11 +2255,48 @@ static bool smtp_connect_upstream(TunnelConfig *cfg, SOCKET *remoteSockOut,
     int authCode = 0;
     if (!smtp_authenticate_tls(ssl, cfg, reply, &authCode))
     {
+        if (authCodeOut)
+        {
+            *authCodeOut = authCode;
+        }
         log_message(cfg->logLevel, "[SMTP] upstream authentication failed");
         return false;
     }
+    if (authCodeOut)
+    {
+        *authCodeOut = authCode;
+    }
     log_state_transition(cfg->logLevel, "AUTH_OK");
 
+    return true;
+}
+
+static bool smtp_ensure_upstream_authed(SmtpSession *session, TunnelConfig *cfg,
+                                        SOCKET *remoteSock, mbedtls_ssl_context *ssl,
+                                        mbedtls_ssl_config *conf,
+                                        mbedtls_ctr_drbg_context *ctr_drbg,
+                                        mbedtls_entropy_context *entropy,
+                                        mbedtls_x509_crt *cacert,
+                                        int *authCodeOut)
+{
+    if (!session || !cfg)
+    {
+        return false;
+    }
+    if (session->upstreamAuthed)
+    {
+        return true;
+    }
+
+    char ehloReply[2048];
+    if (!smtp_connect_upstream(cfg, remoteSock, ssl, conf, ctr_drbg, entropy, cacert,
+                               ehloReply, sizeof(ehloReply), authCodeOut))
+    {
+        return false;
+    }
+    session->upstreamConnected = true;
+    session->upstreamTlsOk = true;
+    session->upstreamAuthed = true;
     return true;
 }
 
@@ -2133,8 +2412,9 @@ static DWORD WINAPI connection_thread(LPVOID param)
         mbedtls_entropy_context entropy;
         mbedtls_x509_crt cacert;
         bool tlsReady = false;
-        bool upstreamReady = false;
         bool greeted = false;
+        SmtpSession session;
+        smtp_session_init(&session);
 
         SmtpRecvBuffer clientState;
         memset(&clientState, 0, sizeof(clientState));
@@ -2178,7 +2458,7 @@ static DWORD WINAPI connection_thread(LPVOID param)
 
             if (_strnicmp(line, "RSET", 4) == 0)
             {
-                if (upstreamReady)
+                if (session.upstreamConnected)
                 {
                     if (!tls_send_all(&ssl, line, len, cfg.logLevel))
                     {
@@ -2206,7 +2486,7 @@ static DWORD WINAPI connection_thread(LPVOID param)
             {
                 log_state_transition(cfg.logLevel, "QUIT");
                 send_client_response(clientSock, "221 Bye\r\n");
-                if (upstreamReady)
+                if (session.upstreamConnected)
                 {
                     tls_send_all(&ssl, "QUIT\r\n", 6, cfg.logLevel);
                 }
@@ -2232,35 +2512,99 @@ static DWORD WINAPI connection_thread(LPVOID param)
             if (_strnicmp(line, "MAIL", 4) == 0 || _strnicmp(line, "RCPT", 4) == 0 ||
                 _strnicmp(line, "DATA", 4) == 0)
             {
-                if (!upstreamReady)
+                bool isMail = (_strnicmp(line, "MAIL", 4) == 0);
+                bool isRcpt = (_strnicmp(line, "RCPT", 4) == 0);
+                bool isData = (_strnicmp(line, "DATA", 4) == 0);
+
+                if (cfg.mode == MODE_SMTP_AUTH_TLS && !session.upstreamAuthed)
                 {
-                    char ehloReply[2048];
-                    if (!smtp_connect_upstream(&cfg, &remoteSock, &ssl, &conf, &ctr_drbg,
-                                               &entropy, &cacert, ehloReply,
-                                               sizeof(ehloReply)))
+                    // O2 fix: AUTH before MAIL FROM.
+                    if (isMail)
                     {
-                        send_client_response(clientSock, "451 Upstream unavailable\r\n");
+                        log_message(cfg.logLevel, "[SMTP] buffering MAIL FROM until AUTH");
+                        smtp_buffer_mail_from(&session, line);
+                    }
+                    else if (isRcpt)
+                    {
+                        log_message(cfg.logLevel, "[SMTP] buffering RCPT TO until AUTH");
+                        if (!smtp_buffer_rcpt(&session, line))
+                        {
+                            send_client_response(clientSock, "451 Too many recipients\r\n");
+                            continue;
+                        }
+                    }
+                    else if (isData)
+                    {
+                        log_message(cfg.logLevel, "[SMTP] DATA received before AUTH");
+                    }
+
+                    int authCode = 0;
+                    if (!smtp_ensure_upstream_authed(&session, &cfg, &remoteSock, &ssl,
+                                                     &conf, &ctr_drbg, &entropy, &cacert,
+                                                     &authCode))
+                    {
+                        if (authCode == 535 || authCode == 530)
+                        {
+                            send_client_response(clientSock, "535 Authentication failed\r\n");
+                        }
+                        else
+                        {
+                            send_client_response(clientSock, "451 Upstream unavailable\r\n");
+                        }
                         break;
                     }
                     tlsReady = true;
-                    upstreamReady = true;
+
+                    if (!smtp_replay_buffered_commands(&session, clientSock, &ssl, &cfg))
+                    {
+                        break;
+                    }
+
+                    if (!isData)
+                    {
+                        continue;
+                    }
                 }
 
-                if (_strnicmp(line, "MAIL", 4) == 0)
+                if (!session.upstreamConnected)
+                {
+                    char ehloReply[2048];
+                    int authCode = 0;
+                    if (!smtp_connect_upstream(&cfg, &remoteSock, &ssl, &conf, &ctr_drbg,
+                                               &entropy, &cacert, ehloReply,
+                                               sizeof(ehloReply), &authCode))
+                    {
+                        if (authCode == 535 || authCode == 530)
+                        {
+                            send_client_response(clientSock, "535 Authentication failed\r\n");
+                        }
+                        else
+                        {
+                            send_client_response(clientSock, "451 Upstream unavailable\r\n");
+                        }
+                        break;
+                    }
+                    tlsReady = true;
+                    session.upstreamConnected = true;
+                    session.upstreamTlsOk = true;
+                    session.upstreamAuthed = true;
+                }
+
+                if (isMail)
                 {
                     log_state_transition(cfg.logLevel, "MAIL");
                 }
-                if (_strnicmp(line, "RCPT", 4) == 0)
+                if (isRcpt)
                 {
                     log_state_transition(cfg.logLevel, "RCPT");
                 }
-                if (_strnicmp(line, "DATA", 4) == 0)
+                if (isData)
                 {
                     log_state_transition(cfg.logLevel, "DATA");
                 }
 
                 const char *forcedMailFrom = smtp_force_mail_from(&cfg);
-                if (_strnicmp(line, "MAIL", 4) == 0 && forcedMailFrom)
+                if (isMail && forcedMailFrom)
                 {
                     char rewritten[512];
                     if (smtp_build_mail_from_line(line, forcedMailFrom,
@@ -2275,13 +2619,12 @@ static DWORD WINAPI connection_thread(LPVOID param)
                     }
                 }
 
-                if (!tls_send_all(&ssl, line, len, cfg.logLevel))
+                if (isData)
                 {
-                    break;
-                }
-
-                if (_strnicmp(line, "DATA", 4) == 0)
-                {
+                    if (!tls_send_all(&ssl, line, len, cfg.logLevel))
+                    {
+                        break;
+                    }
                     if (!smtp_handle_data(clientSock, &ssl, &cfg, &clientState))
                     {
                         break;
@@ -2289,13 +2632,8 @@ static DWORD WINAPI connection_thread(LPVOID param)
                 }
                 else
                 {
-                    char reply[2048];
-                    if (!read_smtp_reply_tls(&ssl, reply, sizeof(reply), NULL, NULL,
-                                             g_config.ioTimeoutMs, LOG_DEBUG))
-                    {
-                        break;
-                    }
-                    if (!send_all_plain(clientSock, reply, (int)strlen(reply)))
+                    if (!smtp_send_and_forward_reply(clientSock, &ssl, line, len,
+                                                     cfg.logLevel, g_config.ioTimeoutMs))
                     {
                         break;
                     }
