@@ -191,6 +191,32 @@ All upstream submissions follow this sequence:
 
 ---
 
+## Manual Testing Notes
+
+### O2 / Tlen SMTP AUTH TLS profile
+
+1. Configure a tunnel profile:
+   - `ListenPort=225` (example)
+   - `RemoteHost=poczta.o2.pl` or `smtp.tlen.pl`
+   - `RemotePort=465`
+   - `Mode=SMTP_AUTH_TLS`
+   - `AuthMode=LOGIN`
+   - `ForceMailFrom=user@o2.pl`
+2. Configure Outlook to send via `localhost:225`, plaintext SMTP, no outgoing auth.
+3. Expected log sequence:
+   - local: `HELO`
+   - local: `MAIL FROM` buffered
+   - upstream: connect + TLS OK
+   - upstream: `EHLO` capabilities include `AUTH`
+   - upstream: `AUTH LOGIN` → `334` → send user → `334` → send pass → `235`
+   - upstream: rewritten `MAIL FROM` sent after AUTH → `250`
+   - upstream: `RCPT` / `DATA` accepted → `250` / `354` / `250`
+
+### GMX regression check
+
+1. Use an existing GMX profile.
+2. Verify submission still succeeds end-to-end.
+
 ## Logging
 
 All activity is written to `tlswrap98.log`.
