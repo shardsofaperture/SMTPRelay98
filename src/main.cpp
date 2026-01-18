@@ -498,7 +498,8 @@ extern "C" int bio_send_dbg(void *ctx, const unsigned char *buf, size_t len)
     if (ret == SOCKET_ERROR)
     {
         int wsaErr = WSAGetLastError();
-        log_line("[TLS->R]", "TLS send failed: wsa=%d", wsaErr);
+        log_line("[TLS->R]", "send FAILED sock=%ld len=%u WSA=%d",
+                 (long)sock, (unsigned)len, wsaErr);
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
     return ret;
@@ -616,18 +617,20 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
         return false;
     }
 
-    SOCKET remoteSock = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
-                                             g_config.connectTimeoutMs);
-    if (remoteSock == INVALID_SOCKET)
+    SOCKET rs = connect_with_timeout(cfg->remoteHost, cfg->remotePort,
+                                     g_config.connectTimeoutMs);
+    if (rs == INVALID_SOCKET)
     {
         log_message(cfg->logLevel, "%s: connect failed", cfg->name);
         return false;
     }
+    *remoteSockOut = rs;
 
-    if (!smtp_discard_banner(remoteSock, g_config.startTlsTimeoutMs))
+    if (!smtp_discard_banner(*remoteSockOut, g_config.startTlsTimeoutMs))
     {
         log_message(cfg->logLevel, "[SMTP] failed to read remote banner");
-        closesocket(remoteSock);
+        closesocket(*remoteSockOut);
+        *remoteSockOut = INVALID_SOCKET;
         return false;
     }
     log_message(cfg->logLevel, "[SMTP] connected upstream, discarded remote 220 banner");
@@ -641,44 +644,50 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
             len = recv_line(clientSock, line, sizeof(line), g_config.ioTimeoutMs);
             if (len <= 0)
             {
-                closesocket(remoteSock);
+                closesocket(*remoteSockOut);
+                *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
         }
         haveLine = false;
 
         bool isEhlo = (_strnicmp(line, "EHLO", 4) == 0) || (_strnicmp(line, "HELO", 4) == 0);
-        if (!send_all_plain(remoteSock, line, len))
+        if (!send_all_plain(*remoteSockOut, line, len))
         {
-            closesocket(remoteSock);
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
             return false;
         }
 
         bool gotOk = false;
-        if (!smtp_forward_response(remoteSock, clientSock, g_config.startTlsTimeoutMs, &gotOk))
+        if (!smtp_forward_response(*remoteSockOut, clientSock, g_config.startTlsTimeoutMs, &gotOk))
         {
-            closesocket(remoteSock);
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
             return false;
         }
 
         if (isEhlo && gotOk)
         {
             log_message(cfg->logLevel, "[SMTP] relayed EHLO, now upgrading upstream via STARTTLS");
-            if (!send_all_plain(remoteSock, "STARTTLS\r\n", 10))
+            if (!send_all_plain(*remoteSockOut, "STARTTLS\r\n", 10))
             {
-                closesocket(remoteSock);
+                closesocket(*remoteSockOut);
+                *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
-            len = recv_line(remoteSock, line, sizeof(line), g_config.startTlsTimeoutMs);
+            len = recv_line(*remoteSockOut, line, sizeof(line), g_config.startTlsTimeoutMs);
             if (len <= 0 || strncmp(line, "220", 3) != 0)
             {
                 log_message(cfg->logLevel, "[SMTP] STARTTLS rejected: %s", line);
-                closesocket(remoteSock);
+                closesocket(*remoteSockOut);
+                *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
-            if (!tls_handshake(&remoteSock, cfg, ssl, conf, ctr_drbg, entropy, cacert))
+            if (!tls_handshake(remoteSockOut, cfg, ssl, conf, ctr_drbg, entropy, cacert))
             {
-                closesocket(remoteSock);
+                closesocket(*remoteSockOut);
+                *remoteSockOut = INVALID_SOCKET;
                 return false;
             }
             log_message(cfg->logLevel, "[SMTP] upstream TLS handshake OK");
@@ -686,7 +695,6 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
         }
     }
 
-    *remoteSockOut = remoteSock;
     return true;
 }
 

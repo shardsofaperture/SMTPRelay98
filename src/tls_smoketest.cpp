@@ -40,6 +40,8 @@ extern "C" void tls_smoketest(void)
         fclose(f);
         return;
     }
+    SOCKET *psock = new SOCKET;
+    *psock = s;
 
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
@@ -75,7 +77,7 @@ extern "C" void tls_smoketest(void)
     ret = mbedtls_ssl_set_hostname(&ssl, host); /* SNI */
     if(ret != 0) { fprintf(f, "set_hostname failed\r\n"); write_err(f, ret); goto done; }
 
-    mbedtls_ssl_set_bio(&ssl, &s, bio_send_dbg, bio_recv_dbg, NULL);
+    mbedtls_ssl_set_bio(&ssl, psock, bio_send_dbg, bio_recv_dbg, NULL);
 
     fprintf(f, "Handshake...\r\n");
     while((ret = mbedtls_ssl_handshake(&ssl)) != 0)
@@ -124,5 +126,6 @@ done:
     mbedtls_ctr_drbg_free(&ctr);
     mbedtls_entropy_free(&entropy);
 
-    closesocket(s);
+    closesocket(*psock);
+    delete psock;
 }
