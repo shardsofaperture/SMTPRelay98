@@ -48,6 +48,9 @@ static int vc6_snprintf(char* dst, size_t dstSize, const char* fmt, ...)
 #define ID_TRAY_OPENCFG 1002
 #define ID_TRAY_VIEWLOG 1003
 #define ID_TRAY_EXIT 1004
+#define ID_TRAY_RELOAD 1005
+#define ID_TRAY_MULTIPROFILE 1006
+#define ID_TRAY_PROFILE_BASE 2000
 
 #define LOG_ERROR 0
 #define LOG_INFO 1
@@ -59,7 +62,8 @@ static int vc6_snprintf(char* dst, size_t dstSize, const char* fmt, ...)
 enum TunnelMode
 {
     MODE_DIRECT_TLS = 0,
-    MODE_STARTTLS_SMTP = 1
+    MODE_STARTTLS_SMTP = 1,
+    MODE_SMTP_AUTH_TLS = 2
 };
 
 enum AuthMode
@@ -67,6 +71,12 @@ enum AuthMode
     AUTH_MODE_AUTO = 0,
     AUTH_MODE_PLAIN = 1,
     AUTH_MODE_LOGIN = 2
+};
+
+enum UpstreamTlsMode
+{
+    TLS_MODE_DIRECT = 0,
+    TLS_MODE_STARTTLS = 1
 };
 
 struct GlobalConfig
@@ -87,12 +97,16 @@ struct TunnelConfig
     char remoteHost[256];
     int remotePort;
     TunnelMode mode;
+    UpstreamTlsMode tlsMode;
     int verifyCert;
     char sni[256];
     int logLevel;
     char upstreamUser[128];
     char upstreamPass[128];
     AuthMode authMode;
+    char forceMailFrom[256];
+    char forceHeaderFrom[256];
+    char logLabel[128];
 };
 
 struct TunnelState
@@ -103,6 +117,16 @@ struct TunnelState
     volatile LONG running;
 };
 
+struct ProfileConfig
+{
+    char name[64];
+    char displayName[128];
+    char smtpTunnel[64];
+    char imapTunnel[64];
+    char pop3Tunnel[64];
+    bool useAllTunnels;
+};
+
 struct ConnectionContext
 {
     TunnelConfig cfg;
@@ -111,12 +135,34 @@ struct ConnectionContext
 };
 
 static GlobalConfig g_config;
+static std::vector<TunnelConfig> g_tunnelConfigs;
+static std::vector<ProfileConfig> g_profiles;
 static std::vector<TunnelState *> g_tunnels;
 static HINSTANCE g_hInstance = NULL;
 static HWND g_hWnd = NULL;
 static volatile LONG g_running = 0;
 static volatile LONG g_shutdown = 0;
 static CRITICAL_SECTION g_logLock;
+static DWORD g_logContextTls = TLS_OUT_OF_INDEXES;
+static char g_activeProfile[64] = "";
+static bool g_multiProfile = false;
+
+static void set_log_context(const char *label)
+{
+    if (g_logContextTls != TLS_OUT_OF_INDEXES)
+    {
+        TlsSetValue(g_logContextTls, (LPVOID)label);
+    }
+}
+
+static const char *get_log_context()
+{
+    if (g_logContextTls == TLS_OUT_OF_INDEXES)
+    {
+        return NULL;
+    }
+    return (const char *)TlsGetValue(g_logContextTls);
+}
 
 static void log_message(int level, const char *fmt, ...)
 {
@@ -134,12 +180,22 @@ static void log_message(int level, const char *fmt, ...)
         fprintf(fp, "%04d-%02d-%02d %02d:%02d:%02d ",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
+        char message[1024];
         va_list args;
         va_start(args, fmt);
-        vfprintf(fp, fmt, args);
+        _vsnprintf(message, sizeof(message), fmt, args);
         va_end(args);
+        message[sizeof(message) - 1] = '\0';
 
-        fprintf(fp, "\r\n");
+        const char *context = get_log_context();
+        if (context && context[0] != '\0')
+        {
+            fprintf(fp, "[%s] %s\r\n", context, message);
+        }
+        else
+        {
+            fprintf(fp, "%s\r\n", message);
+        }
         fclose(fp);
     }
     LeaveCriticalSection(&g_logLock);
@@ -156,12 +212,22 @@ static void log_line(const char *tag, const char *fmt, ...)
         fprintf(fp, "%04d-%02d-%02d %02d:%02d:%02d %s ",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, tag);
 
+        char message[1024];
         va_list args;
         va_start(args, fmt);
-        vfprintf(fp, fmt, args);
+        _vsnprintf(message, sizeof(message), fmt, args);
         va_end(args);
+        message[sizeof(message) - 1] = '\0';
 
-        fprintf(fp, "\r\n");
+        const char *context = get_log_context();
+        if (context && context[0] != '\0')
+        {
+            fprintf(fp, "[%s] %s\r\n", context, message);
+        }
+        else
+        {
+            fprintf(fp, "%s\r\n", message);
+        }
         fclose(fp);
     }
     LeaveCriticalSection(&g_logLock);
@@ -203,7 +269,20 @@ static TunnelMode parse_mode(const char *mode)
     {
         return MODE_STARTTLS_SMTP;
     }
+    if (mode && lstrcmpiA(mode, "SMTP_AUTH_TLS") == 0)
+    {
+        return MODE_SMTP_AUTH_TLS;
+    }
     return MODE_DIRECT_TLS;
+}
+
+static UpstreamTlsMode parse_tls_mode(const char *mode)
+{
+    if (mode && lstrcmpiA(mode, "STARTTLS") == 0)
+    {
+        return TLS_MODE_STARTTLS;
+    }
+    return TLS_MODE_DIRECT;
 }
 
 static AuthMode parse_auth_mode(const char *mode)
@@ -237,10 +316,22 @@ static void load_global_config(const char *iniPath)
                                                        g_config.startTlsTimeoutMs, iniPath);
 }
 
-static void load_tunnel_config(const char *iniPath, const char *section, TunnelConfig *cfg)
+static void read_ini_string(const char *section, const char *key, const char *fallbackKey,
+                            const char *defaultValue, char *out, DWORD outCap,
+                            const char *iniPath)
+{
+    GetPrivateProfileStringA(section, key, defaultValue, out, outCap, iniPath);
+    if (out[0] == '\0' && fallbackKey && fallbackKey[0] != '\0')
+    {
+        GetPrivateProfileStringA(section, fallbackKey, defaultValue, out, outCap, iniPath);
+    }
+}
+
+static void load_tunnel_config(const char *iniPath, const char *section,
+                               const char *tunnelName, TunnelConfig *cfg)
 {
     memset(cfg, 0, sizeof(TunnelConfig));
-    strncpy(cfg->name, section, sizeof(cfg->name) - 1);
+    strncpy(cfg->name, tunnelName, sizeof(cfg->name) - 1);
     GetPrivateProfileStringA(section, "ListenAddr", "127.0.0.1",
                              cfg->listenAddr, sizeof(cfg->listenAddr), iniPath);
     cfg->listenPort = GetPrivateProfileIntA(section, "ListenPort", 0, iniPath);
@@ -257,16 +348,29 @@ static void load_tunnel_config(const char *iniPath, const char *section, TunnelC
     GetPrivateProfileStringA(section, "Mode", "DIRECT_TLS", modeBuf, sizeof(modeBuf), iniPath);
     cfg->mode = parse_mode(modeBuf);
 
+    char tlsModeBuf[64];
+    const char *defaultTls = (cfg->mode == MODE_STARTTLS_SMTP) ? "STARTTLS" : "DIRECT_TLS";
+    GetPrivateProfileStringA(section, "TlsMode", defaultTls, tlsModeBuf, sizeof(tlsModeBuf),
+                             iniPath);
+    cfg->tlsMode = parse_tls_mode(tlsModeBuf);
+
     cfg->logLevel = GetPrivateProfileIntA(section, "LogLevel", g_config.logLevel, iniPath);
 
-    GetPrivateProfileStringA(section, "upstream_user", "",
-                             cfg->upstreamUser, sizeof(cfg->upstreamUser), iniPath);
-    GetPrivateProfileStringA(section, "upstream_pass", "",
-                             cfg->upstreamPass, sizeof(cfg->upstreamPass), iniPath);
+    read_ini_string(section, "UpstreamUser", "upstream_user", "",
+                    cfg->upstreamUser, sizeof(cfg->upstreamUser), iniPath);
+    read_ini_string(section, "UpstreamPass", "upstream_pass", "",
+                    cfg->upstreamPass, sizeof(cfg->upstreamPass), iniPath);
     char authModeBuf[32];
-    GetPrivateProfileStringA(section, "auth_mode", "auto",
-                             authModeBuf, sizeof(authModeBuf), iniPath);
+    read_ini_string(section, "AuthMode", "auth_mode", "auto",
+                    authModeBuf, sizeof(authModeBuf), iniPath);
     cfg->authMode = parse_auth_mode(authModeBuf);
+
+    GetPrivateProfileStringA(section, "ForceMailFrom", "",
+                             cfg->forceMailFrom, sizeof(cfg->forceMailFrom), iniPath);
+    GetPrivateProfileStringA(section, "ForceHeaderFrom", "",
+                             cfg->forceHeaderFrom, sizeof(cfg->forceHeaderFrom), iniPath);
+
+    strncpy(cfg->logLabel, cfg->name, sizeof(cfg->logLabel) - 1);
 }
 
 static void free_tunnels()
@@ -278,6 +382,149 @@ static void free_tunnels()
     g_tunnels.clear();
 }
 
+static void free_loaded_config()
+{
+    g_tunnelConfigs.clear();
+    g_profiles.clear();
+}
+
+static void trim_whitespace(char *text)
+{
+    if (!text || text[0] == '\0')
+    {
+        return;
+    }
+    char *end = text + strlen(text) - 1;
+    while (end >= text && isspace((unsigned char)*end))
+    {
+        *end = '\0';
+        --end;
+    }
+    char *start = text;
+    while (*start && isspace((unsigned char)*start))
+    {
+        ++start;
+    }
+    if (start != text)
+    {
+        memmove(text, start, strlen(start) + 1);
+    }
+}
+
+static void load_profile_config(const char *iniPath, const char *section,
+                                const char *profileName, ProfileConfig *profile)
+{
+    memset(profile, 0, sizeof(ProfileConfig));
+    strncpy(profile->name, profileName, sizeof(profile->name) - 1);
+    GetPrivateProfileStringA(section, "DisplayName", profileName,
+                             profile->displayName, sizeof(profile->displayName), iniPath);
+    GetPrivateProfileStringA(section, "SmtpTunnel", "",
+                             profile->smtpTunnel, sizeof(profile->smtpTunnel), iniPath);
+    GetPrivateProfileStringA(section, "ImapTunnel", "",
+                             profile->imapTunnel, sizeof(profile->imapTunnel), iniPath);
+    GetPrivateProfileStringA(section, "Pop3Tunnel", "",
+                             profile->pop3Tunnel, sizeof(profile->pop3Tunnel), iniPath);
+    profile->useAllTunnels = false;
+    trim_whitespace(profile->smtpTunnel);
+    trim_whitespace(profile->imapTunnel);
+    trim_whitespace(profile->pop3Tunnel);
+}
+
+static const char *profile_display_name(const ProfileConfig *profile)
+{
+    if (!profile)
+    {
+        return "";
+    }
+    if (profile->displayName[0] != '\0')
+    {
+        return profile->displayName;
+    }
+    return profile->name;
+}
+
+static const char *get_registry_string(const char *valueName, char *out, DWORD outCap)
+{
+    HKEY hKey = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\TLSWrap98", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+    {
+        return NULL;
+    }
+    DWORD type = REG_SZ;
+    DWORD size = outCap;
+    if (RegQueryValueExA(hKey, valueName, NULL, &type, (BYTE *)out, &size) != ERROR_SUCCESS)
+    {
+        RegCloseKey(hKey);
+        return NULL;
+    }
+    out[outCap - 1] = '\0';
+    RegCloseKey(hKey);
+    return out;
+}
+
+static bool get_registry_dword(const char *valueName, DWORD *valueOut)
+{
+    HKEY hKey = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\TLSWrap98", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+    DWORD type = REG_DWORD;
+    DWORD size = sizeof(DWORD);
+    DWORD value = 0;
+    bool ok = (RegQueryValueExA(hKey, valueName, NULL, &type, (BYTE *)&value, &size) == ERROR_SUCCESS);
+    RegCloseKey(hKey);
+    if (ok && valueOut)
+    {
+        *valueOut = value;
+    }
+    return ok;
+}
+
+static void set_registry_string(const char *valueName, const char *value)
+{
+    HKEY hKey = NULL;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\TLSWrap98", 0, NULL,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+    {
+        return;
+    }
+    RegSetValueExA(hKey, valueName, 0, REG_SZ,
+                   (const BYTE *)value, (DWORD)strlen(value) + 1);
+    RegCloseKey(hKey);
+}
+
+static void set_registry_dword(const char *valueName, DWORD value)
+{
+    HKEY hKey = NULL;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\TLSWrap98", 0, NULL,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+    {
+        return;
+    }
+    RegSetValueExA(hKey, valueName, 0, REG_DWORD, (const BYTE *)&value, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
+static void resolve_active_profile()
+{
+    if (g_profiles.empty())
+    {
+        return;
+    }
+    if (g_activeProfile[0] != '\0')
+    {
+        for (size_t i = 0; i < g_profiles.size(); ++i)
+        {
+            if (lstrcmpiA(g_profiles[i].name, g_activeProfile) == 0)
+            {
+                return;
+            }
+        }
+    }
+    strncpy(g_activeProfile, g_profiles[0].name, sizeof(g_activeProfile) - 1);
+}
+
 static bool load_config()
 {
     char iniPath[MAX_PATH];
@@ -285,6 +532,44 @@ static bool load_config()
 
     load_default_config();
     load_global_config(iniPath);
+
+    g_activeProfile[0] = '\0';
+    g_multiProfile = false;
+
+    char activeProfileBuf[64];
+    GetPrivateProfileStringA("global", "ActiveProfile", "", activeProfileBuf,
+                             sizeof(activeProfileBuf), iniPath);
+    if (activeProfileBuf[0] == '\0')
+    {
+        char registryProfile[64];
+        if (get_registry_string("ActiveProfile", registryProfile, sizeof(registryProfile)))
+        {
+            strncpy(activeProfileBuf, registryProfile, sizeof(activeProfileBuf) - 1);
+        }
+    }
+    if (activeProfileBuf[0] != '\0')
+    {
+        strncpy(g_activeProfile, activeProfileBuf, sizeof(g_activeProfile) - 1);
+    }
+
+    char multiBuf[16];
+    GetPrivateProfileStringA("global", "MultiProfile", "", multiBuf, sizeof(multiBuf), iniPath);
+    if (multiBuf[0] == '\0')
+    {
+        DWORD multiValue = 0;
+        if (get_registry_dword("MultiProfile", &multiValue))
+        {
+            g_multiProfile = (multiValue != 0);
+        }
+        else
+        {
+            g_multiProfile = false;
+        }
+    }
+    else
+    {
+        g_multiProfile = (atoi(multiBuf) != 0);
+    }
 
     char sectionNames[4096];
     DWORD len = GetPrivateProfileSectionNamesA(sectionNames, sizeof(sectionNames), iniPath);
@@ -294,7 +579,7 @@ static bool load_config()
         return false;
     }
 
-    free_tunnels();
+    free_loaded_config();
 
     const char *ptr = sectionNames;
     while (*ptr)
@@ -302,28 +587,193 @@ static bool load_config()
         if (_strnicmp(ptr, "tunnel ", 7) == 0)
         {
             TunnelConfig cfg;
-            load_tunnel_config(iniPath, ptr, &cfg);
-            if (cfg.listenPort > 0 && cfg.remotePort > 0 && cfg.remoteHost[0] != '\0')
+            char tunnelName[64];
+            strncpy(tunnelName, ptr + 7, sizeof(tunnelName) - 1);
+            tunnelName[sizeof(tunnelName) - 1] = '\0';
+            trim_whitespace(tunnelName);
+            if (tunnelName[0] != '\0')
             {
-                TunnelState *state = new TunnelState();
-                memset(state, 0, sizeof(TunnelState));
-                state->cfg = cfg;
-                state->listenSock = INVALID_SOCKET;
-                state->thread = NULL;
-                state->running = 0;
-                g_tunnels.push_back(state);
+                load_tunnel_config(iniPath, ptr, tunnelName, &cfg);
+                if (cfg.listenPort > 0 && cfg.remotePort > 0 && cfg.remoteHost[0] != '\0')
+                {
+                    g_tunnelConfigs.push_back(cfg);
+                }
+            }
+        }
+        else if (_strnicmp(ptr, "profile ", 8) == 0)
+        {
+            ProfileConfig profile;
+            char profileName[64];
+            strncpy(profileName, ptr + 8, sizeof(profileName) - 1);
+            profileName[sizeof(profileName) - 1] = '\0';
+            trim_whitespace(profileName);
+            if (profileName[0] != '\0')
+            {
+                load_profile_config(iniPath, ptr, profileName, &profile);
+                g_profiles.push_back(profile);
             }
         }
         ptr += strlen(ptr) + 1;
     }
 
-    if (g_tunnels.empty())
+    if (g_profiles.empty())
+    {
+        ProfileConfig profile;
+        memset(&profile, 0, sizeof(profile));
+        strncpy(profile.name, "Default", sizeof(profile.name) - 1);
+        strncpy(profile.displayName, "Default", sizeof(profile.displayName) - 1);
+        profile.useAllTunnels = true;
+        g_profiles.push_back(profile);
+    }
+
+    resolve_active_profile();
+
+    if (g_tunnelConfigs.empty())
     {
         log_message(LOG_ERROR, "No valid tunnel definitions found in %s", iniPath);
         return false;
     }
 
     return true;
+}
+
+struct PortKey
+{
+    char addr[64];
+    int port;
+};
+
+static const TunnelConfig *find_tunnel_config(const char *name)
+{
+    if (!name || name[0] == '\0')
+    {
+        return NULL;
+    }
+    for (size_t i = 0; i < g_tunnelConfigs.size(); ++i)
+    {
+        if (lstrcmpiA(g_tunnelConfigs[i].name, name) == 0)
+        {
+            return &g_tunnelConfigs[i];
+        }
+    }
+    return NULL;
+}
+
+static bool port_in_use(const std::vector<PortKey> &usedPorts, const char *addr, int port)
+{
+    for (size_t i = 0; i < usedPorts.size(); ++i)
+    {
+        if (usedPorts[i].port == port && lstrcmpiA(usedPorts[i].addr, addr) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void add_used_port(std::vector<PortKey> &usedPorts, const char *addr, int port)
+{
+    PortKey key;
+    memset(&key, 0, sizeof(key));
+    strncpy(key.addr, addr, sizeof(key.addr) - 1);
+    key.port = port;
+    usedPorts.push_back(key);
+}
+
+static void apply_profile_label(TunnelConfig *cfg, const char *profileName)
+{
+    if (!cfg)
+    {
+        return;
+    }
+    if (profileName && profileName[0] != '\0')
+    {
+        snprintf(cfg->logLabel, sizeof(cfg->logLabel), "%s/%s", profileName, cfg->name);
+    }
+    else
+    {
+        strncpy(cfg->logLabel, cfg->name, sizeof(cfg->logLabel) - 1);
+    }
+}
+
+static void add_running_tunnel(const TunnelConfig *cfg, const char *profileName)
+{
+    if (!cfg)
+    {
+        return;
+    }
+    TunnelState *state = new TunnelState();
+    memset(state, 0, sizeof(TunnelState));
+    state->cfg = *cfg;
+    apply_profile_label(&state->cfg, profileName);
+    state->listenSock = INVALID_SOCKET;
+    state->thread = NULL;
+    state->running = 0;
+    g_tunnels.push_back(state);
+}
+
+static void add_profile_tunnels(const ProfileConfig *profile, std::vector<PortKey> &usedPorts)
+{
+    if (!profile)
+    {
+        return;
+    }
+    if (profile->useAllTunnels)
+    {
+        for (size_t i = 0; i < g_tunnelConfigs.size(); ++i)
+        {
+            const TunnelConfig *cfg = &g_tunnelConfigs[i];
+            if (port_in_use(usedPorts, cfg->listenAddr, cfg->listenPort))
+            {
+                log_message(LOG_ERROR, "Profile %s: tunnel %s skipped (port in use)",
+                            profile->name, cfg->name);
+                continue;
+            }
+            add_used_port(usedPorts, cfg->listenAddr, cfg->listenPort);
+            add_running_tunnel(cfg, profile->name);
+        }
+        return;
+    }
+
+    const char *tunnels[3] = { profile->smtpTunnel, profile->imapTunnel, profile->pop3Tunnel };
+    for (int i = 0; i < 3; ++i)
+    {
+        if (tunnels[i][0] == '\0')
+        {
+            continue;
+        }
+        const TunnelConfig *cfg = find_tunnel_config(tunnels[i]);
+        if (!cfg)
+        {
+            log_message(LOG_ERROR, "Profile %s references unknown tunnel %s",
+                        profile->name, tunnels[i]);
+            continue;
+        }
+        if (port_in_use(usedPorts, cfg->listenAddr, cfg->listenPort))
+        {
+            log_message(LOG_ERROR, "Profile %s: tunnel %s skipped (port in use)",
+                        profile->name, cfg->name);
+            continue;
+        }
+        add_used_port(usedPorts, cfg->listenAddr, cfg->listenPort);
+        add_running_tunnel(cfg, profile->name);
+    }
+}
+
+static const ProfileConfig *find_profile_by_name(const char *name)
+{
+    if (!name || name[0] == '\0')
+    {
+        return NULL;
+    }
+    for (size_t i = 0; i < g_profiles.size(); ++i)
+    {
+        if (lstrcmpiA(g_profiles[i].name, name) == 0)
+        {
+            return &g_profiles[i];
+        }
+    }
+    return NULL;
 }
 
 static int socket_set_blocking(SOCKET s, bool blocking)
@@ -1336,6 +1786,99 @@ static bool smtp_authenticate_tls(mbedtls_ssl_context *ssl, TunnelConfig *cfg,
     return false;
 }
 
+static const char *smtp_force_mail_from(const TunnelConfig *cfg)
+{
+    if (!cfg)
+    {
+        return NULL;
+    }
+    if (cfg->forceMailFrom[0] != '\0')
+    {
+        return cfg->forceMailFrom;
+    }
+    if (cfg->mode == MODE_SMTP_AUTH_TLS && cfg->upstreamUser[0] != '\0')
+    {
+        return cfg->upstreamUser;
+    }
+    return NULL;
+}
+
+static bool smtp_build_mail_from_line(const char *line, const char *forced,
+                                      char *out, int outCap)
+{
+    if (!line || !forced || forced[0] == '\0')
+    {
+        return false;
+    }
+    const char *fromPtr = find_case_insensitive(line, "FROM:");
+    if (!fromPtr)
+    {
+        return false;
+    }
+
+    const char *addrStart = fromPtr + 5;
+    while (*addrStart == ' ' || *addrStart == '\t')
+    {
+        ++addrStart;
+    }
+
+    const char *addrEnd = addrStart;
+    if (*addrStart == '<')
+    {
+        const char *gt = strchr(addrStart, '>');
+        if (gt)
+        {
+            addrEnd = gt + 1;
+        }
+    }
+    if (addrEnd == addrStart)
+    {
+        while (*addrEnd && *addrEnd != ' ' && *addrEnd != '\t' &&
+               *addrEnd != '\r' && *addrEnd != '\n')
+        {
+            ++addrEnd;
+        }
+    }
+
+    const char *tail = addrEnd;
+    while (*tail == ' ' || *tail == '\t')
+    {
+        ++tail;
+    }
+    const char *eol = strstr(line, "\r\n");
+    if (!eol)
+    {
+        eol = strstr(line, "\n");
+    }
+    const char *lineEnd = eol ? eol : line + strlen(line);
+    int tailLen = (tail < lineEnd) ? (int)(lineEnd - tail) : 0;
+
+    int written = snprintf(out, outCap, "MAIL FROM:<%s>", forced);
+    if (written <= 0 || written >= outCap)
+    {
+        return false;
+    }
+    if (tailLen > 0)
+    {
+        if (written + 1 + tailLen >= outCap)
+        {
+            return false;
+        }
+        out[written++] = ' ';
+        memcpy(out + written, tail, tailLen);
+        written += tailLen;
+        out[written] = '\0';
+    }
+    if (written + 2 >= outCap)
+    {
+        return false;
+    }
+    out[written++] = '\r';
+    out[written++] = '\n';
+    out[written] = '\0';
+    return true;
+}
+
 static bool smtp_connect_upstream(TunnelConfig *cfg, SOCKET *remoteSockOut,
                                   mbedtls_ssl_context *ssl, mbedtls_ssl_config *conf,
                                   mbedtls_ctr_drbg_context *ctr_drbg,
@@ -1357,70 +1900,73 @@ static bool smtp_connect_upstream(TunnelConfig *cfg, SOCKET *remoteSockOut,
 
     log_state_transition(cfg->logLevel, "CONNECT");
 
-    SmtpRecvBuffer remoteState;
-    memset(&remoteState, 0, sizeof(remoteState));
     char reply[2048];
     int code = 0;
-    if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
-                         &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
-    {
-        log_message(cfg->logLevel, "[SMTP] failed to read upstream banner");
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
-    }
-
     const char *ehlo = "EHLO localhost\r\n";
-    if (!send_all_plain(*remoteSockOut, ehlo, (int)strlen(ehlo)))
+    if (cfg->tlsMode == TLS_MODE_STARTTLS)
     {
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
-    }
-    log_state_transition(cfg->logLevel, "EHLO");
-    if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
-                         &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
-    {
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
-    }
-    if (code != 250)
-    {
-        log_message(cfg->logLevel, "[SMTP] upstream EHLO rejected (code=%d)", code);
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
-    }
-    if (!parse_starttls_cap(reply))
-    {
-        log_message(cfg->logLevel, "[SMTP] upstream did not advertise STARTTLS");
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
-    }
+        SmtpRecvBuffer remoteState;
+        memset(&remoteState, 0, sizeof(remoteState));
+        if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
+                             &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
+        {
+            log_message(cfg->logLevel, "[SMTP] failed to read upstream banner");
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
 
-    const char *starttls = "STARTTLS\r\n";
-    if (!send_all_plain(*remoteSockOut, starttls, (int)strlen(starttls)))
-    {
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
-    }
-    log_state_transition(cfg->logLevel, "STARTTLS");
-    if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
-                         &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
-    {
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
-    }
-    if (code != 220)
-    {
-        log_message(cfg->logLevel, "[SMTP] STARTTLS rejected (code=%d)", code);
-        closesocket(*remoteSockOut);
-        *remoteSockOut = INVALID_SOCKET;
-        return false;
+        if (!send_all_plain(*remoteSockOut, ehlo, (int)strlen(ehlo)))
+        {
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
+        log_state_transition(cfg->logLevel, "EHLO");
+        if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
+                             &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
+        {
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
+        if (code != 250)
+        {
+            log_message(cfg->logLevel, "[SMTP] upstream EHLO rejected (code=%d)", code);
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
+        if (!parse_starttls_cap(reply))
+        {
+            log_message(cfg->logLevel, "[SMTP] upstream did not advertise STARTTLS");
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
+
+        const char *starttls = "STARTTLS\r\n";
+        if (!send_all_plain(*remoteSockOut, starttls, (int)strlen(starttls)))
+        {
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
+        log_state_transition(cfg->logLevel, "STARTTLS");
+        if (!read_smtp_reply(*remoteSockOut, reply, sizeof(reply), &code, NULL,
+                             &remoteState, g_config.startTlsTimeoutMs, LOG_DEBUG))
+        {
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
+        if (code != 220)
+        {
+            log_message(cfg->logLevel, "[SMTP] STARTTLS rejected (code=%d)", code);
+            closesocket(*remoteSockOut);
+            *remoteSockOut = INVALID_SOCKET;
+            return false;
+        }
     }
 
     if (!tls_handshake(remoteSockOut, cfg, ssl, conf, ctr_drbg, entropy, cacert))
@@ -1430,6 +1976,16 @@ static bool smtp_connect_upstream(TunnelConfig *cfg, SOCKET *remoteSockOut,
         return false;
     }
     log_state_transition(cfg->logLevel, "TLS_OK");
+
+    if (cfg->tlsMode == TLS_MODE_DIRECT)
+    {
+        if (!read_smtp_reply_tls(ssl, reply, sizeof(reply), &code, NULL,
+                                 g_config.startTlsTimeoutMs, LOG_DEBUG))
+        {
+            log_message(cfg->logLevel, "[SMTP] failed to read upstream banner");
+            return false;
+        }
+    }
 
     if (!tls_send_all(ssl, ehlo, (int)strlen(ehlo), cfg->logLevel))
     {
@@ -1484,6 +2040,8 @@ static bool smtp_handle_data(SOCKET clientSock, mbedtls_ssl_context *ssl, Tunnel
         return true;
     }
 
+    bool inHeaders = true;
+    bool skipFromContinuation = false;
     for (;;)
     {
         char line[1024];
@@ -1502,6 +2060,34 @@ static bool smtp_handle_data(SOCKET clientSock, mbedtls_ssl_context *ssl, Tunnel
                 return false;
             }
             break;
+        }
+
+        if (inHeaders)
+        {
+            if (line[0] == '\r' || line[0] == '\n')
+            {
+                inHeaders = false;
+                skipFromContinuation = false;
+            }
+            else if (skipFromContinuation && (line[0] == ' ' || line[0] == '\t'))
+            {
+                continue;
+            }
+            else
+            {
+                skipFromContinuation = false;
+                if (cfg->forceHeaderFrom[0] != '\0' &&
+                    _strnicmp(line, "From:", 5) == 0)
+                {
+                    char rewritten[512];
+                    snprintf(rewritten, sizeof(rewritten), "From: %s\r\n",
+                             cfg->forceHeaderFrom);
+                    len = (int)strlen(rewritten);
+                    strncpy(line, rewritten, sizeof(line) - 1);
+                    line[sizeof(line) - 1] = '\0';
+                    skipFromContinuation = true;
+                }
+            }
         }
 
         if (line[0] == '.')
@@ -1537,7 +2123,9 @@ static DWORD WINAPI connection_thread(LPVOID param)
     SOCKET remoteSock = ctx->remoteSock;
     delete ctx;
 
-    if (cfg.mode == MODE_STARTTLS_SMTP)
+    set_log_context(cfg.logLabel);
+
+    if (cfg.mode == MODE_STARTTLS_SMTP || cfg.mode == MODE_SMTP_AUTH_TLS)
     {
         mbedtls_ssl_context ssl;
         mbedtls_ssl_config conf;
@@ -1669,6 +2257,22 @@ static DWORD WINAPI connection_thread(LPVOID param)
                 if (_strnicmp(line, "DATA", 4) == 0)
                 {
                     log_state_transition(cfg.logLevel, "DATA");
+                }
+
+                const char *forcedMailFrom = smtp_force_mail_from(&cfg);
+                if (_strnicmp(line, "MAIL", 4) == 0 && forcedMailFrom)
+                {
+                    char rewritten[512];
+                    if (smtp_build_mail_from_line(line, forcedMailFrom,
+                                                  rewritten, sizeof(rewritten)))
+                    {
+                        // O2.PL rejects messages when AUTH identity and MAIL FROM disagree (SPF alignment).
+                        log_message(cfg.logLevel, "[SMTP] MAIL FROM rewritten to %s",
+                                    forcedMailFrom);
+                        len = (int)strlen(rewritten);
+                        strncpy(line, rewritten, sizeof(line) - 1);
+                        line[sizeof(line) - 1] = '\0';
+                    }
                 }
 
                 if (!tls_send_all(&ssl, line, len, cfg.logLevel))
@@ -1840,6 +2444,7 @@ cleanup:
 static DWORD WINAPI listener_thread(LPVOID param)
 {
     TunnelState *state = (TunnelState *)param;
+    set_log_context(state->cfg.logLabel);
 
     SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listenSock == INVALID_SOCKET)
@@ -1886,7 +2491,7 @@ static DWORD WINAPI listener_thread(LPVOID param)
         }
 
         SOCKET remoteSock = INVALID_SOCKET;
-        if (state->cfg.mode == MODE_STARTTLS_SMTP)
+        if (state->cfg.mode == MODE_STARTTLS_SMTP || state->cfg.mode == MODE_SMTP_AUTH_TLS)
         {
             const char *banner = "220 localhost TLSWrap98 ready\r\n";
             if (!send_all_plain(clientSock, banner, (int)strlen(banner)))
@@ -1949,6 +2554,36 @@ static void start_tunnels()
 
     g_shutdown = 0;
 
+    free_tunnels();
+
+    std::vector<PortKey> usedPorts;
+    if (g_multiProfile)
+    {
+        for (size_t i = 0; i < g_profiles.size(); ++i)
+        {
+            add_profile_tunnels(&g_profiles[i], usedPorts);
+        }
+    }
+    else
+    {
+        const ProfileConfig *profile = find_profile_by_name(g_activeProfile);
+        if (!profile && !g_profiles.empty())
+        {
+            profile = &g_profiles[0];
+        }
+        if (profile)
+        {
+            add_profile_tunnels(profile, usedPorts);
+        }
+    }
+
+    if (g_tunnels.empty())
+    {
+        MessageBoxA(g_hWnd, "No valid tunnels found for selected profile(s).",
+                    "TLSWrap98", MB_OK | MB_ICONERROR);
+        return;
+    }
+
     for (size_t i = 0; i < g_tunnels.size(); ++i)
     {
         TunnelState *state = g_tunnels[i];
@@ -1992,6 +2627,7 @@ static void stop_tunnels()
     }
 
     g_running = 0;
+    free_tunnels();
 }
 
 static void open_config()
@@ -2004,6 +2640,63 @@ static void open_config()
 static void open_log()
 {
     ShellExecuteA(NULL, "open", g_config.logFile, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void persist_active_profile()
+{
+    char iniPath[MAX_PATH];
+    build_path(iniPath, sizeof(iniPath), APP_INI_NAME);
+    WritePrivateProfileStringA("global", "ActiveProfile", g_activeProfile, iniPath);
+    set_registry_string("ActiveProfile", g_activeProfile);
+}
+
+static void persist_multi_profile()
+{
+    char iniPath[MAX_PATH];
+    char valueBuf[8];
+    build_path(iniPath, sizeof(iniPath), APP_INI_NAME);
+    snprintf(valueBuf, sizeof(valueBuf), "%d", g_multiProfile ? 1 : 0);
+    WritePrivateProfileStringA("global", "MultiProfile", valueBuf, iniPath);
+    set_registry_dword("MultiProfile", g_multiProfile ? 1 : 0);
+}
+
+static void switch_active_profile(const char *profileName)
+{
+    if (!profileName || profileName[0] == '\0')
+    {
+        return;
+    }
+    strncpy(g_activeProfile, profileName, sizeof(g_activeProfile) - 1);
+    persist_active_profile();
+    if (g_running && !g_multiProfile)
+    {
+        stop_tunnels();
+        start_tunnels();
+    }
+}
+
+static void toggle_multi_profile()
+{
+    g_multiProfile = !g_multiProfile;
+    persist_multi_profile();
+    if (g_running)
+    {
+        stop_tunnels();
+        start_tunnels();
+    }
+}
+
+static void reload_config_and_restart()
+{
+    if (g_running)
+    {
+        stop_tunnels();
+        start_tunnels();
+    }
+    else
+    {
+        load_config();
+    }
 }
 
 static void tray_add_icon()
@@ -2038,9 +2731,39 @@ static void tray_show_menu()
         return;
     }
 
+    HMENU hProfiles = CreatePopupMenu();
+    if (hProfiles)
+    {
+        for (size_t i = 0; i < g_profiles.size(); ++i)
+        {
+            const ProfileConfig *profile = &g_profiles[i];
+            UINT flags = MF_STRING;
+            AppendMenuA(hProfiles, flags, ID_TRAY_PROFILE_BASE + (UINT)i,
+                        profile_display_name(profile));
+        }
+        AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hProfiles, "Profiles");
+        if (!g_profiles.empty())
+        {
+            for (size_t i = 0; i < g_profiles.size(); ++i)
+            {
+                if (lstrcmpiA(g_profiles[i].name, g_activeProfile) == 0)
+                {
+                    CheckMenuRadioItem(hProfiles, ID_TRAY_PROFILE_BASE,
+                                       ID_TRAY_PROFILE_BASE + (UINT)g_profiles.size() - 1,
+                                       ID_TRAY_PROFILE_BASE + (UINT)i, MF_BYCOMMAND);
+                    break;
+                }
+            }
+        }
+    }
+
+    AppendMenuA(hMenu, MF_STRING | (g_multiProfile ? MF_CHECKED : 0),
+                ID_TRAY_MULTIPROFILE, "Run all profiles (MultiProfile)");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, ID_TRAY_STARTSTOP, g_running ? "Stop" : "Start");
     AppendMenuA(hMenu, MF_STRING, ID_TRAY_OPENCFG, "Open Config");
     AppendMenuA(hMenu, MF_STRING, ID_TRAY_VIEWLOG, "View Log");
+    AppendMenuA(hMenu, MF_STRING, ID_TRAY_RELOAD, "Reload INI");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, ID_TRAY_EXIT, "Exit");
 
@@ -2080,8 +2803,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case ID_TRAY_VIEWLOG:
             open_log();
             return 0;
+        case ID_TRAY_RELOAD:
+            reload_config_and_restart();
+            return 0;
+        case ID_TRAY_MULTIPROFILE:
+            toggle_multi_profile();
+            return 0;
         case ID_TRAY_EXIT:
             PostQuitMessage(0);
+            return 0;
+        }
+        if (LOWORD(wParam) >= ID_TRAY_PROFILE_BASE &&
+            LOWORD(wParam) < ID_TRAY_PROFILE_BASE + (int)g_profiles.size())
+        {
+            size_t index = (size_t)(LOWORD(wParam) - ID_TRAY_PROFILE_BASE);
+            if (index < g_profiles.size())
+            {
+                switch_active_profile(g_profiles[index].name);
+            }
             return 0;
         }
         break;
@@ -2101,6 +2840,8 @@ g_hInstance = hInstance;
 
 InitializeCriticalSection(&g_logLock);
 load_default_config();
+g_logContextTls = TlsAlloc;
+set_log_context("main");
 
 WSADATA wsaData;
 if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -2114,6 +2855,11 @@ if (lpCmdLine && strstr(lpCmdLine, "-tls-test"))
     tls_smoketest();
     WSACleanup();
     DeleteCriticalSection(&g_logLock);
+    if (g_logContextTls != TLS_OUT_OF_INDEXES)
+    {
+        TlsFree(g_logContextTls);
+        g_logContextTls = TLS_OUT_OF_INDEXES;
+    }
     return 0;
 }
 
@@ -2130,6 +2876,7 @@ if (lpCmdLine && strstr(lpCmdLine, "-tls-test"))
                            NULL, NULL, hInstance, NULL);
 
     tray_add_icon();
+    load_config();
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
@@ -2144,5 +2891,10 @@ if (lpCmdLine && strstr(lpCmdLine, "-tls-test"))
 
     WSACleanup();
     DeleteCriticalSection(&g_logLock);
+    if (g_logContextTls != TLS_OUT_OF_INDEXES)
+    {
+        TlsFree(g_logContextTls);
+        g_logContextTls = TLS_OUT_OF_INDEXES;
+    }
     return 0;
 }
