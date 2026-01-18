@@ -3178,7 +3178,11 @@ g_hInstance = hInstance;
 
 InitializeCriticalSection(&g_logLock);
 load_default_config();
-g_logContextTls = TlsAlloc;
+g_logContextTls = TlsAlloc();
+if (g_logContextTls == TLS_OUT_OF_INDEXES) {
+	MessageBoxA(NULL, "TlsAlloc failed", "TLSWrap98", MB_OK | MB_ICONERROR);
+	return 1;
+}
 set_log_context("main");
 
 WSADATA wsaData;
