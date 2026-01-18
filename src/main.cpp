@@ -521,7 +521,7 @@ extern "C" int bio_recv_dbg(void *ctx, unsigned char *buf, size_t len)
     return ret;
 }
 
-static bool tls_handshake(SOCKET sock, TunnelConfig *cfg, mbedtls_ssl_context *ssl,
+static bool tls_handshake(SOCKET *psock, TunnelConfig *cfg, mbedtls_ssl_context *ssl,
                           mbedtls_ssl_config *conf, mbedtls_ctr_drbg_context *ctr_drbg,
                           mbedtls_entropy_context *entropy, mbedtls_x509_crt *cacert)
 {
@@ -576,7 +576,7 @@ static bool tls_handshake(SOCKET sock, TunnelConfig *cfg, mbedtls_ssl_context *s
         mbedtls_ssl_set_hostname(ssl, cfg->remoteHost);
     }
 
-    mbedtls_ssl_set_bio(ssl, &sock, bio_send_dbg, bio_recv_dbg, NULL);
+    mbedtls_ssl_set_bio(ssl, psock, bio_send_dbg, bio_recv_dbg, NULL);
 
     while ((ret = mbedtls_ssl_handshake(ssl)) != 0)
     {
@@ -676,7 +676,7 @@ static bool smtp_lazy_starttls(SOCKET clientSock, SOCKET *remoteSockOut, TunnelC
                 closesocket(remoteSock);
                 return false;
             }
-            if (!tls_handshake(remoteSock, cfg, ssl, conf, ctr_drbg, entropy, cacert))
+            if (!tls_handshake(&remoteSock, cfg, ssl, conf, ctr_drbg, entropy, cacert))
             {
                 closesocket(remoteSock);
                 return false;
@@ -829,7 +829,7 @@ smtp_cleanup:
     mbedtls_entropy_context entropy;
     mbedtls_x509_crt cacert;
 
-    if (!tls_handshake(remoteSock, &cfg, &ssl, &conf, &ctr_drbg, &entropy, &cacert))
+    if (!tls_handshake(&remoteSock, &cfg, &ssl, &conf, &ctr_drbg, &entropy, &cacert))
     {
         closesocket(clientSock);
         closesocket(remoteSock);
