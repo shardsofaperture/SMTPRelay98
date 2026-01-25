@@ -275,10 +275,11 @@ License texts are included in the `license/` directory.
 
 ## Status
 
-🚧 **Work in progress — not functional yet.**  
-🚫 **Not working with Advisor 2 pagers at this time.**  
+✔ Working  
+✔ Confirmed TLS 1.2 upstream  
+✔ Successfully sends mail from Outlook on Windows 98  
 
-This project is **still under active development** and is **not yet a finished, functional SMTP submission bridge**.
+This is a **finished, functional SMTP submission bridge**.
 
 ---
 
