@@ -1,5 +1,7 @@
 # TLSWrap98 Architecture
 
+> **Status notice:** This project is still a work in progress and is not functional yet. It is **not working with Advisor 2 pagers** at this time.
+
 ## Overview
 TLSWrap98 is a Windows 98 SE system-tray TCP-to-TLS proxy that provides local plaintext sockets and forwards them to remote TLS 1.2 servers. Each tunnel listens on `ListenAddr:ListenPort`, optionally performs STARTTLS, then establishes TLS 1.2 to the remote host and proxies bytes in both directions.
 
